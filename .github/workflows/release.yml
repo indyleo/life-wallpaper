@@ -1,22 +1,34 @@
-name: Create Release
+name: Auto Tag & Release
 
 on:
   push:
-    tags:
-      - "v*" # Triggers on tags like v1.0.0, v2.1.3
+    branches:
+      - main
 
 permissions:
-  contents: write # Required to create releases
+  contents: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # Bump version from package.json and push tag
+      - name: Bump version and push tag
+        id: tag
+        uses: mathieudutour/github-tag-action@v7
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag_prefix: "v"
+          # bump_rule: minor  # optional: major | minor | patch
+
+      # Create the release
       - name: Create GitHub Release
+        if: steps.tag.outputs.new_tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true # Auto-generate notes from PRs/commits
-          draft: false
+          tag_name: ${{ steps.tag.outputs.new_tag }}
+          generate_release_notes: true
