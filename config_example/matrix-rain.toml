@@ -1,0 +1,21 @@
+# Matrix-inspired green code rain with Conway's Game of Life.
+cell_size = 8
+fps = 8
+density = 0.22
+rule = "highlife"
+color = "green"
+trail = true
+trail_length = 5
+rain = true
+rain_density = 1.8
+overlay = true
+sysload = false
+patterns = true
+stamps = false
+bg = "#07130b"
+newborn = "#b8ffb8"
+mature = "#26d941"
+old = "#16852b"
+ancient = "#075c1b"
+rain_color = "#3cff70"
+overlay_color = "#78e890"

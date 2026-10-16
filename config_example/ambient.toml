@@ -1,0 +1,12 @@
+# Ambient, slower-moving wallpaper. Copy desired values into config.toml.
+fps = 2
+density = 0.16
+rule = "life"
+color = "age"
+trail = true
+trail_length = 6
+rain = false
+overlay = false
+sysload = false
+patterns = true
+stamps = false

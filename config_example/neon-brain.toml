@@ -1,0 +1,21 @@
+# Fast Brian's Brain activity with a purple/blue neon palette.
+cell_size = 6
+fps = 10
+density = 0.28
+reseed_density = 0.32
+rule = "brain"
+color = "age"
+trail = true
+trail_length = 7
+rain = false
+overlay = true
+sysload = false
+patterns = true
+stamps = true
+bg = "#100b1f"
+newborn = "#ff65d4"
+mature = "#9b7bff"
+old = "#4bdcff"
+ancient = "#f7f0ff"
+dying = "#2d2454"
+overlay_color = "#c4b5fd"

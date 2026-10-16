@@ -1,0 +1,17 @@
+# Minimal, uncluttered wallpaper: no trails, rain, status text, or stamps.
+cell_size = 10
+fps = 3
+density = 0.18
+rule = "life"
+color = "aqua"
+trail = false
+rain = false
+overlay = false
+sysload = false
+patterns = false
+stamps = false
+bg = "#101820"
+newborn = "#8ec07c"
+mature = "#83a598"
+old = "#458588"
+ancient = "#3c6e71"

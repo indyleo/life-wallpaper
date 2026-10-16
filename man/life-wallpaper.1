@@ -1,0 +1,155 @@
+.TH LIFE-WALLPAPER 1 "October 2026" "life-wallpaper 0.1.0" "User Commands"
+.SH NAME
+life-wallpaper \- Conway's Game of Life as a native Wayland wallpaper
+.SH SYNOPSIS
+.B life-wallpaper
+.RI [ options ]
+.SH DESCRIPTION
+.B life-wallpaper
+runs an animated cellular-automaton wallpaper on Wayland compositors that support
+.BR zwlr_layer_shell_v1 .
+It can manage all outputs, react to output hotplugging, and reload configuration
+changes while running.
+.SH OPTIONS
+.TP
+.BR -h , " " --help
+Print command-line help and exit.
+.TP
+.BR -o , " " --output " " NAME
+Render only on the named output. By default, all outputs are used.
+.TP
+.B --list-outputs
+Print detected output names, make/model, logical size, and scale, then exit.
+.TP
+.BI --config " PATH"
+Read configuration from PATH. If omitted, the default is
+.I $XDG_CONFIG_HOME/life-wallpaper/config.toml
+or
+.IR $HOME/.config/life-wallpaper/config.toml .
+If the selected file does not exist, the application attempts to create it from
+the bundled default configuration.
+.TP
+.BI --preset " NAME"
+Start with one of the built-in configuration presets: 
+.BR default ,
+.BR ambient ,
+.BR matrix-rain ,
+.BR neon-brain , or
+.BR minimal .
+Preset values are loaded first, values in an existing config file override the
+preset, and command-line options override both. If a config file is missing, it
+is created from the default template but does not override the selected preset
+on that first run.
+.TP
+.BI --cell-size " PX"
+Cell size in logical pixels (2 to 64; default 8).
+.TP
+.BI --fps " HZ"
+Generations per second (0.1 to 60; default 4).
+.TP
+.BI --density " VALUE"
+Initial and reseed population density (0 to 1; default 0.25; also sets reseed density).
+.TP
+.BI --rule " RULE"
+Automaton rule: 
+.BR life ,
+.BR highlife ,
+.BR daynight ,
+.BR seeds ,
+.BR brain ,
+.BR rotate , or a rule in B/S notation such as
+.BR B3/S23 .
+.TP
+.BI --color " COLOR"
+Use age-based coloring or a fixed named color (green, yellow, orange, red, aqua,
+blue, purple) or a hex color such as
+.BR #rrggbb .
+.TP
+.B --[no-]trail
+Enable or disable fading trails from dead cells.
+.TP
+.B --[no-]rain
+Enable or disable faint hex code-rain behind the cells.
+.TP
+.B --[no-]overlay
+Enable or disable the generation/population status line.
+.TP
+.B --[no-]sysload
+Enable or disable CPU-load-driven speed, sparks, and heat.
+.TP
+.B --[no-]patterns
+Enable or disable periodic pattern injections.
+.TP
+.B --[no-]stamps
+Enable or disable periodic logo and text stamps.
+.PP
+Other supported configuration keys can be set in the TOML file. See
+.BR config_example/config.default.toml
+for the complete list and comments.
+.SH PRESETS
+.TP
+.B default
+Balanced default colors and animation.
+.TP
+.B ambient
+Slower, calmer animation with fewer visual elements.
+.TP
+.B matrix-rain
+Green palette, code-rain effect, and status overlay.
+.TP
+.B neon-brain
+Fast Brian's Brain simulation with a neon palette.
+.TP
+.B minimal
+Uncluttered appearance without trails, rain, overlays, patterns, or stamps.
+.SH CONFIGURATION
+The configuration file is checked on each animation tick. Saving changes applies
+them without restarting the wallpaper. A
+.B SIGHUP
+also triggers a reload:
+.PP
+.RS
+.nf
+pkill -HUP life-wallpaper
+.fi
+.RE
+.PP
+Configuration values are loaded in this order: built-in defaults, selected
+preset, config file, then command-line flags. Later sources override earlier ones.
+.SH EXAMPLES
+.TP
+Start with the ambient preset:
+.B life-wallpaper --preset ambient
+.TP
+Use Matrix Rain on one output:
+.B life-wallpaper --preset matrix-rain --output DP-1
+.TP
+Use a preset and override its frame rate:
+.B life-wallpaper --preset neon-brain --fps 6
+.TP
+Use a custom configuration file:
+.B life-wallpaper --config ~/.config/life-wallpaper/work.toml
+.TP
+List available outputs:
+.B life-wallpaper --list-outputs
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Base directory for the default configuration path.
+.TP
+.B HOME
+Used to derive the default configuration path when XDG_CONFIG_HOME is unset.
+.SH SIGNALS
+.TP
+.B SIGHUP
+Reload the selected configuration file.
+.TP
+.B SIGINT, SIGTERM
+Shut down cleanly.
+.SH NOTES
+Requires a Wayland compositor with the wlr layer-shell protocol. The program is
+not intended for X11 sessions without a compatible Wayland environment.
+.SH AUTHORS
+Project contributors.
+.SH LICENSE
+MIT
