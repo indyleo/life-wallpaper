@@ -63,6 +63,12 @@ Preset values are loaded first, then an existing config file can override them, 
 
 The manual page is in `man/life-wallpaper.1`. View it with `man ./man/life-wallpaper.1`.
 
+## Staleness and resets
+
+The board is never wiped on a timer. When it goes calm (`stagnation_secs`, default 60, with moving or chaotic cells below `calm_pct` of the grid, or the whole board repeating), new life is added on top of what is already there: soup patches in the emptiest areas plus gliders. A full reset only happens when still lifes and oscillators cover `clutter_pct` of the grid (default 8, `0` = never). `soft_reset_secs` still exists as an optional timed reset and defaults to `0` (off).
+
+If your existing `~/.config/life-wallpaper/config.toml` was created from an older template, it still contains `soft_reset_secs = 300`. Set it to `0` (or delete the line) to stop the timed resets.
+
 ## Configuration hot reload
 
 On first launch, the app creates `~/.config/life-wallpaper/config.toml` from the bundled `config_example/config.default.toml` template (or creates the file selected by `--config`). Parent directories are created as needed. If the config file cannot be created, the app logs a warning and continues with the built-in `Config::default()` values. Those built-in values match the bundled template.

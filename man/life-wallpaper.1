@@ -83,6 +83,18 @@ Enable or disable periodic pattern injections.
 .B --[no-]stamps
 Enable or disable periodic logo and text stamps.
 .PP
+The board is not wiped on a timer. When it goes calm for
+.B stagnation_secs
+(moving or chaotic cells below
+.B calm_pct
+percent of the grid, or the whole board repeating), new life is added on top of
+the existing cells. A full reset happens only when settled shapes (still lifes
+and oscillators) cover
+.B clutter_pct
+percent of the grid (default 8; 0 disables it). The optional
+.B soft_reset_secs
+timer is off by default (0).
+.PP
 Other supported configuration keys can be set in the TOML file. See
 .BR config_example/config.default.toml
 for the complete list and comments.

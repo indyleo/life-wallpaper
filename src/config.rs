@@ -47,8 +47,16 @@ pub struct Config {
     pub sysload: bool,
     pub patterns: bool,
     pub stamps: bool,
+    /// 0 = never do a timed full reset (default).
     pub soft_reset_secs: u64,
+    /// How long the board must stay calm before new life is injected.
     pub stagnation_secs: u64,
+    /// Percent of the grid taken up by settled shapes (still lifes,
+    /// oscillators) at which a full reset happens. 0 = never.
+    pub clutter_pct: f64,
+    /// Board counts as calm while moving/chaotic cells are below this
+    /// percent of the grid. 0 = only a fully repeating board is calm.
+    pub calm_pct: f64,
     pub glider_min_secs: u64,
     pub glider_max_secs: u64,
     pub special_min_secs: u64,
@@ -76,8 +84,10 @@ impl Default for Config {
             sysload: false,
             patterns: true,
             stamps: true,
-            soft_reset_secs: 300,
+            soft_reset_secs: 0,
             stagnation_secs: 60,
+            clutter_pct: 8.0,
+            calm_pct: 0.3,
             glider_min_secs: 60,
             glider_max_secs: 90,
             special_min_secs: 90,
@@ -173,7 +183,9 @@ impl Config {
             "sysload" => self.sysload = parse_bool(val)?,
             "patterns" => self.patterns = parse_bool(val)?,
             "stamps" => self.stamps = parse_bool(val)?,
-            "soft_reset_secs" => self.soft_reset_secs = num(val, 1, 86_400)?,
+            "soft_reset_secs" => self.soft_reset_secs = num(val, 0, 86_400)?,
+            "clutter_pct" => self.clutter_pct = num(val, 0.0, 100.0)?,
+            "calm_pct" => self.calm_pct = num(val, 0.0, 100.0)?,
             "stagnation_secs" => self.stagnation_secs = num(val, 1, 86_400)?,
             "glider_min_secs" => self.glider_min_secs = num(val, 1, 86_400)?,
             "glider_max_secs" => self.glider_max_secs = num(val, 1, 86_400)?,

@@ -1,5 +1,7 @@
 //! Policy layer, one `Sim` per output: owns the automaton, the code-rain layer
-//! and every timer (soft reset, stagnation, gliders, specials, stamps).
+//! and every timer (optional soft reset, calm detection, gliders, specials,
+//! stamps). A calm board gets new life injected; a full reset only happens
+//! when settled shapes clog the grid (or the optional timer fires).
 //! Pure logic driven by `tick(now, ..)`; no Wayland in here.
 
 use std::time::{Duration, Instant};
@@ -16,6 +18,9 @@ use crate::patterns;
 /// 16 = also catches oscillators up to period 16 (blinkers, pulsars, ...),
 ///      which otherwise keep the grid "changing" forever.
 const HISTORY: usize = 16;
+
+/// Run the settled-shape census every this many generations.
+const CENSUS_EVERY: u64 = 8;
 
 pub const RAIN_LEVELS: u8 = 8;
 
@@ -98,6 +103,7 @@ pub struct Sim {
     hist_len: usize,
     hist_pos: usize,
     stagnant_since: Option<Instant>,
+    calm_since: Option<Instant>,
 }
 
 fn secs_between<R: Rng>(rng: &mut R, lo: u64, hi: u64) -> Duration {
@@ -136,6 +142,7 @@ impl Sim {
             hist_len: 0,
             hist_pos: 0,
             stagnant_since: None,
+            calm_since: None,
         };
         s.reschedule(now, cfg);
         s
@@ -202,8 +209,8 @@ impl Sim {
             r.tick(&mut self.rng, cfg.rain_density);
         }
 
-        // 1. Soft reset on a fixed cadence.
-        if now >= self.next_soft_reset {
+        // 1. Optional timed full reset (soft_reset_secs = 0 means never).
+        if cfg.soft_reset_secs > 0 && now >= self.next_soft_reset {
             self.reseed(cfg);
             self.next_soft_reset = now + Duration::from_secs(cfg.soft_reset_secs);
             return;
@@ -242,13 +249,37 @@ impl Sim {
             self.next_stamp = now + secs_between(&mut self.rng, cfg.stamp_min_secs, cfg.stamp_max_secs);
         }
 
-        // 6. Stagnation: a state seen within the last HISTORY generations for
-        //    `stagnation_secs` straight => reseed.
+        // 6. Clutter / calm census. A full reset only happens when settled
+        //    shapes (still lifes, oscillators) fill too much of the grid;
+        //    a merely calm board gets new life added on top of what it has.
+        if self.gen % CENSUS_EVERY == 0 {
+            let total = (self.life.cols() * self.life.rows()) as f64;
+            let (live, settled) = self.life.census();
+            if cfg.clutter_pct > 0.0 && settled as f64 * 100.0 >= total * cfg.clutter_pct {
+                self.reseed(cfg);
+                return;
+            }
+            let active = (live - settled) as f64;
+            if cfg.calm_pct > 0.0 && active * 100.0 < total * cfg.calm_pct {
+                self.calm_since.get_or_insert(now);
+            } else {
+                self.calm_since = None;
+            }
+        }
+        if let Some(since) = self.calm_since {
+            if now.duration_since(since) >= Duration::from_secs(cfg.stagnation_secs) {
+                self.inject_fresh();
+                return;
+            }
+        }
+
+        // 7. Whole-grid repeat: a state seen within the last HISTORY
+        //    generations for `stagnation_secs` straight => inject new life.
         let h = self.life.hash();
         if self.history[..self.hist_len].contains(&h) {
             let since = *self.stagnant_since.get_or_insert(now);
             if now.duration_since(since) >= Duration::from_secs(cfg.stagnation_secs) {
-                self.reseed(cfg);
+                self.inject_fresh();
                 return;
             }
         } else {
@@ -257,6 +288,26 @@ impl Sim {
         self.history[self.hist_pos] = h;
         self.hist_pos = (self.hist_pos + 1) % HISTORY;
         self.hist_len = (self.hist_len + 1).min(HISTORY);
+    }
+
+    /// Add new life without clearing anything: a few soup patches dropped
+    /// into the emptiest parts of the board, plus gliders where they work.
+    fn inject_fresh(&mut self) {
+        let (cols, rows) = (self.life.cols(), self.life.rows());
+        let rule = self.life.rule();
+        let pw = (cols / 3).clamp(4, 32).min(cols);
+        let ph = (rows / 3).clamp(4, 20).min(rows);
+        let density = (0.35 * rule.seed_scale()).min(0.9);
+        for _ in 0..self.rng.gen_range(2..=4) {
+            let (x, y) = self.life.emptiest_spot(&mut self.rng, pw, ph, 24);
+            self.life.soup_patch(&mut self.rng, x, y, pw, ph, density);
+        }
+        if rule.supports_ships() {
+            for _ in 0..self.rng.gen_range(1..=2) {
+                self.life.place_ship_on_edge(&mut self.rng, true, false);
+            }
+        }
+        self.reset_stagnation();
     }
 
     fn inject_special(&mut self) {
@@ -309,6 +360,7 @@ impl Sim {
 
     fn reset_stagnation(&mut self) {
         self.stagnant_since = None;
+        self.calm_since = None;
         self.hist_len = 0;
         self.hist_pos = 0;
     }
@@ -322,24 +374,109 @@ impl Sim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patterns::Pattern;
+
+    fn quiet_cfg() -> Config {
+        Config { patterns: false, stamps: false, glider_min_secs: 100_000, glider_max_secs: 100_000, ..Config::default() }
+    }
 
     #[test]
-    fn empty_grid_is_reseeded_after_stagnation_limit() {
-        let cfg = Config { patterns: false, stamps: false, glider_min_secs: 100_000, glider_max_secs: 100_000, ..Config::default() };
+    fn empty_grid_gets_new_life_after_stagnation_limit() {
+        let cfg = quiet_cfg();
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         s.life.clear();
         let mut now = t0;
-        let mut reseeded = false;
+        let mut revived = false;
         for _ in 0..(70 * 4) {
             now += Duration::from_millis(250);
             s.tick(now, &cfg, 0.0);
-            if s.life.population() > 100 {
-                reseeded = true;
+            if s.life.population() > 20 {
+                revived = true;
                 break;
             }
         }
-        assert!(reseeded);
+        assert!(revived);
+    }
+
+    #[test]
+    fn calm_board_keeps_its_cells_when_new_life_arrives() {
+        let cfg = quiet_cfg();
+        let t0 = Instant::now();
+        let mut s = Sim::new(40, 30, t0, &cfg);
+        s.life.clear();
+        s.life.place(&Pattern::from_art(&["##", "##"]), 5, 5, 0);
+        let mut now = t0;
+        let mut ticks = 0u64;
+        loop {
+            now += Duration::from_millis(250);
+            s.tick(now, &cfg, 0.0);
+            ticks += 1;
+            if s.life.population() > 20 || ticks > 400 {
+                break;
+            }
+        }
+        assert!(s.life.population() > 20, "never injected");
+        assert_eq!(s.gen, ticks, "board was reset instead of added to");
+        for (x, y) in [(5, 5), (6, 5), (5, 6), (6, 6)] {
+            assert_eq!(s.life.cells()[y * 40 + x], 1);
+        }
+    }
+
+    #[test]
+    fn no_timed_reset_by_default() {
+        let cfg = Config { calm_pct: 0.0, clutter_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let t0 = Instant::now();
+        let mut s = Sim::new(40, 30, t0, &cfg);
+        let mut now = t0;
+        for _ in 0..(3600 * 4) {
+            now += Duration::from_millis(250);
+            s.tick(now, &cfg, 0.0);
+        }
+        assert_eq!(s.gen, 3600 * 4, "gen counter only resets on a full reseed");
+    }
+
+    #[test]
+    fn clutter_of_settled_shapes_triggers_full_reset() {
+        let cfg = Config { clutter_pct: 5.0, ..quiet_cfg() };
+        let t0 = Instant::now();
+        let mut s = Sim::new(40, 30, t0, &cfg);
+        s.life.clear();
+        let block = Pattern::from_art(&["##", "##"]);
+        for y in (0..30).step_by(5) {
+            for x in (0..40).step_by(5) {
+                s.life.place(&block, x, y, 0);
+            }
+        }
+        let mut now = t0;
+        let mut reset = false;
+        for _ in 0..150 {
+            now += Duration::from_millis(250);
+            s.tick(now, &cfg, 0.0);
+            if s.gen == 0 {
+                reset = true;
+                break;
+            }
+        }
+        assert!(reset, "clogged board was never reset");
+    }
+
+    #[test]
+    fn sparse_settled_shapes_do_not_reset() {
+        let cfg = Config { clutter_pct: 5.0, calm_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let t0 = Instant::now();
+        let mut s = Sim::new(40, 30, t0, &cfg);
+        s.life.clear();
+        let block = Pattern::from_art(&["##", "##"]);
+        for (x, y) in [(3, 3), (20, 10), (30, 22)] {
+            s.life.place(&block, x, y, 0);
+        }
+        let mut now = t0;
+        for _ in 0..300 {
+            now += Duration::from_millis(250);
+            s.tick(now, &cfg, 0.0);
+        }
+        assert_eq!(s.gen, 300);
     }
 
     #[test]
@@ -373,6 +510,7 @@ mod tests {
             for _ in 0..50 {
                 s.inject_special();
                 s.inject_stamp();
+                s.inject_fresh();
             }
         }
     }

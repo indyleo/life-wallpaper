@@ -93,6 +93,18 @@ pub struct Life {
     next: Vec<u8>,
     age: Vec<u8>,
     trail: Vec<u8>,
+    /// Per-cell occupancy over the last 64 generations (bit 0 = newest).
+    /// Used by `census` to spot cells stuck in a still life / oscillator.
+    hist: Vec<u64>,
+}
+
+/// Longest oscillator period `census` recognises. The 64-bit history leaves
+/// at least 34 bits to compare at this period, so a match is not a fluke.
+const MAX_PERIOD: u32 = 30;
+
+/// True if the occupancy history repeats with some period 1..=MAX_PERIOD.
+fn is_periodic(h: u64) -> bool {
+    (1..=MAX_PERIOD).any(|p| (h ^ (h >> p)) & ((1u64 << (64 - p)) - 1) == 0)
 }
 
 impl Life {
@@ -108,6 +120,7 @@ impl Life {
             next: vec![0; n],
             age: vec![0; n],
             trail: vec![0; n],
+            hist: vec![0; n],
         }
     }
 
@@ -154,6 +167,7 @@ impl Life {
         self.cur.fill(0);
         self.age.fill(0);
         self.trail.fill(0);
+        self.hist.fill(0);
     }
 
     /// Clear, then make each cell alive with probability `density`.
@@ -184,6 +198,7 @@ impl Life {
         self.age = copy(&self.age, old);
         self.trail = copy(&self.trail, old);
         self.next = vec![0; cols * rows];
+        self.hist = vec![0; cols * rows];
         self.cols = cols;
         self.rows = rows;
     }
@@ -209,6 +224,7 @@ impl Life {
             } else {
                 self.trail[i].saturating_sub(1)
             };
+            self.hist[i] = (self.hist[i] << 1) | (now != 0) as u64;
         }
         std::mem::swap(&mut self.cur, &mut self.next);
         changed
@@ -281,6 +297,64 @@ impl Life {
 
     pub fn population(&self) -> usize {
         self.cur.iter().filter(|&&c| c == 1).count()
+    }
+
+    /// `(live, settled)`: occupied cells, and how many of those have been
+    /// repeating with a period of at most 30 generations for the last 64
+    /// (still lifes, oscillators, gun bodies). Gliders and chaos don't count.
+    pub fn census(&self) -> (usize, usize) {
+        let mut live = 0;
+        let mut settled = 0;
+        for (&c, &h) in self.cur.iter().zip(&self.hist) {
+            if c != 0 {
+                live += 1;
+                settled += is_periodic(h) as usize;
+            }
+        }
+        (live, settled)
+    }
+
+    /// Occupied cells inside the `w` x `h` rectangle at (x, y).
+    pub fn count_in(&self, x: usize, y: usize, w: usize, h: usize) -> usize {
+        let (x1, y1) = ((x + w).min(self.cols), (y + h).min(self.rows));
+        let mut n = 0;
+        for yy in y..y1 {
+            n += self.cur[yy * self.cols + x..yy * self.cols + x1].iter().filter(|&&c| c != 0).count();
+        }
+        n
+    }
+
+    /// Top-left of the emptiest of `tries` random `w` x `h` rectangles.
+    pub fn emptiest_spot<R: Rng>(&self, rng: &mut R, w: usize, h: usize, tries: usize) -> (usize, usize) {
+        let (w, h) = (w.min(self.cols), h.min(self.rows));
+        let mut best = (0, 0);
+        let mut best_n = usize::MAX;
+        for _ in 0..tries.max(1) {
+            let x = rng.gen_range(0..=self.cols - w);
+            let y = rng.gen_range(0..=self.rows - h);
+            let n = self.count_in(x, y, w, h);
+            if n < best_n {
+                best_n = n;
+                best = (x, y);
+            }
+        }
+        best
+    }
+
+    /// Scatter random live cells over a rectangle without touching what is
+    /// already alive. Out-of-range parts of the rectangle are ignored.
+    pub fn soup_patch<R: Rng>(&mut self, rng: &mut R, x: usize, y: usize, w: usize, h: usize, density: f64) {
+        let d = density.clamp(0.0, 1.0);
+        for yy in y..(y + h).min(self.rows) {
+            for xx in x..(x + w).min(self.cols) {
+                let i = yy * self.cols + xx;
+                if self.cur[i] == 0 && rng.gen_bool(d) {
+                    self.cur[i] = 1;
+                    self.age[i] = 0;
+                    self.trail[i] = 0;
+                }
+            }
+        }
     }
 
     /// OR a pattern in at (x, y); optionally clear a margin around it first.
@@ -461,6 +535,42 @@ mod tests {
         assert_eq!(l.trail()[2 * 6 + 2], 3);
         l.step();
         assert_eq!(l.trail()[2 * 6 + 2], 2);
+    }
+
+    #[test]
+    fn census_counts_only_settled_cells() {
+        let mut l = Life::new(30, 30, 0, CONWAY);
+        l.place(&Pattern::from_art(&["##", "##"]), 2, 2, 0); // block
+        l.place(&Pattern::from_art(&["###"]), 10, 10, 0); // blinker
+        l.place(&patterns::glider(), 20, 5, 0); // keeps moving
+        for _ in 0..70 {
+            l.step();
+        }
+        assert_eq!(l.census(), (12, 7));
+    }
+
+    #[test]
+    fn periodic_detection_covers_period_30_but_not_pulses() {
+        let p30: u64 = (0..64).fold(0, |h, i| h | ((i % 30 == 0) as u64) << i);
+        assert!(is_periodic(p30));
+        assert!(is_periodic(u64::MAX));
+        assert!(!is_periodic(0b0111_1000_0000));
+    }
+
+    #[test]
+    fn soup_patch_keeps_existing_cells_and_emptiest_spot_avoids_them() {
+        let mut rng = rand::thread_rng();
+        let mut l = Life::new(40, 20, 0, CONWAY);
+        l.soup_patch(&mut rng, 0, 0, 20, 20, 1.0);
+        assert_eq!(l.population(), 400);
+        l.soup_patch(&mut rng, 0, 0, 40, 20, 1.0);
+        assert_eq!(l.population(), 800);
+        let mut l = Life::new(40, 20, 0, CONWAY);
+        l.soup_patch(&mut rng, 0, 0, 20, 20, 1.0);
+        for _ in 0..20 {
+            let (x, y) = l.emptiest_spot(&mut rng, 10, 10, 64);
+            assert_eq!(l.count_in(x, y, 10, 10), 0);
+        }
     }
 
     #[test]
