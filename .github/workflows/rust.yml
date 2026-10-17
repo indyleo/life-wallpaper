@@ -2,21 +2,92 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default token is read-only unless a job escalates.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  build:
-
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+
+      # wayland-backend's "sys" backend links libwayland-client at build
+      # time via pkg-config. Without this, cargo build/clippy fail on a
+      # clean runner with "could not find system library 'wayland-client'".
+      - name: Install Wayland build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwayland-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Wayland build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwayland-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose --locked
+
+      - name: Test
+        run: cargo test --verbose --locked
+
+  # Optional MSRV gate. Uncomment after adding
+  #   rust-version = "1.xx"
+  # to [package] in Cargo.toml (set it to what you actually test against —
+  # SCTK 0.19 + calloop 0.13 need roughly 1.74+; verify on a clean container).
+  #
+  # msrv:
+  #   name: MSRV
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Install Wayland build deps
+  #       run: |
+  #         sudo apt-get update
+  #         sudo apt-get install -y --no-install-recommends libwayland-dev
+  #     - name: Install MSRV toolchain
+  #       uses: dtolnay/rust-toolchain@1.80.0   # match Cargo.toml rust-version
+  #     - name: Cache cargo registry + build artifacts
+  #       uses: Swatinem/rust-cache@v2
+  #     - name: cargo check (MSRV)
+  #       run: cargo check --all-targets --locked

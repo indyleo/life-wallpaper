@@ -1,34 +1,114 @@
-name: Auto Tag & Release
+name: Release
 
 on:
   push:
-    branches:
-      - main
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
 
 permissions:
-  contents: write
+  contents: write # create/update the GitHub Release
+  id-token: write # build provenance attestation
+  attestations: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: life-wallpaper
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # one arch failing must not kill the other
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # Native arm64 runner: avoids cross + a missing Wayland sysroot.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0
 
-      # Bump version from package.json and push tag
-      - name: Bump version and push tag
-        id: tag
-        uses: mathieudutour/github-tag-action@v7
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          tag_prefix: "v"
-          # bump_rule: minor  # optional: major | minor | patch
+      - name: Install Wayland build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwayland-dev pkg-config
 
-      # Create the release
-      - name: Create GitHub Release
-        if: steps.tag.outputs.new_tag != ''
-        uses: softprops/action-gh-release@v2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          tag_name: ${{ steps.tag.outputs.new_tag }}
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Verify tag matches Cargo.toml
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          want="${tag#v}"
+          got="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$want" != "$got" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $got"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          name="${BIN}-${tag}-${{ matrix.target }}"
+          stage="dist/$name"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/${BIN}" "$stage/"
+          cp README.md LICENSE "$stage/"
+          cp man/life-wallpaper.1 "$stage/"
+          cp -r config_example "$stage/"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
