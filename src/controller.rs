@@ -174,8 +174,10 @@ impl Sim {
 
     fn reschedule(&mut self, now: Instant, cfg: &Config) {
         self.next_soft_reset = now + Duration::from_secs(cfg.soft_reset_secs);
-        self.next_glider = now + secs_between(&mut self.rng, cfg.glider_min_secs, cfg.glider_max_secs);
-        self.next_special = now + secs_between(&mut self.rng, cfg.special_min_secs, cfg.special_max_secs);
+        self.next_glider =
+            now + secs_between(&mut self.rng, cfg.glider_min_secs, cfg.glider_max_secs);
+        self.next_special =
+            now + secs_between(&mut self.rng, cfg.special_min_secs, cfg.special_max_secs);
         self.next_stamp = now + secs_between(&mut self.rng, cfg.stamp_min_secs, cfg.stamp_max_secs);
     }
 
@@ -250,7 +252,12 @@ impl Sim {
         }
 
         // 2. System-driven sparks: the busier the CPU, the more often.
-        if cfg.sysload && load > 0.5 && self.rng.gen_bool(((load - 0.5) * 0.6).clamp(0.0, 1.0) as f64) {
+        if cfg.sysload
+            && load > 0.5
+            && self
+                .rng
+                .gen_bool(((load - 0.5) * 0.6).clamp(0.0, 1.0) as f64)
+        {
             self.life.spark(&mut self.rng);
         }
 
@@ -263,7 +270,8 @@ impl Sim {
                     self.life.spark(&mut self.rng);
                 }
             }
-            self.next_glider = now + secs_between(&mut self.rng, cfg.glider_min_secs, cfg.glider_max_secs);
+            self.next_glider =
+                now + secs_between(&mut self.rng, cfg.glider_min_secs, cfg.glider_max_secs);
         }
 
         // 4. Specials: LWSS, pulsar, Gosper gun.
@@ -271,7 +279,8 @@ impl Sim {
             if cfg.patterns {
                 self.inject_special();
             }
-            self.next_special = now + secs_between(&mut self.rng, cfg.special_min_secs, cfg.special_max_secs);
+            self.next_special =
+                now + secs_between(&mut self.rng, cfg.special_min_secs, cfg.special_max_secs);
         }
 
         // 5. Stamps: Tux, Arch logo, terminal text.
@@ -279,17 +288,21 @@ impl Sim {
             if cfg.stamps {
                 self.inject_stamp();
             }
-            self.next_stamp = now + secs_between(&mut self.rng, cfg.stamp_min_secs, cfg.stamp_max_secs);
+            self.next_stamp =
+                now + secs_between(&mut self.rng, cfg.stamp_min_secs, cfg.stamp_max_secs);
         }
 
         // 6. Clutter / calm census. When settled shapes (still lifes,
         //    oscillators) fill too much of the grid, some of them are pruned
         //    away; a merely calm board gets new life added on top of what it
         //    has. Neither wipes the board.
-        if self.gen % CENSUS_EVERY == 0 {
+        if self.gen.is_multiple_of(CENSUS_EVERY) {
             let total = (self.life.cols() * self.life.rows()) as f64;
             let (live, settled) = self.life.census();
-            if self.erase.is_empty() && cfg.clutter_pct > 0.0 && settled as f64 * 100.0 >= total * cfg.clutter_pct {
+            if self.erase.is_empty()
+                && cfg.clutter_pct > 0.0
+                && settled as f64 * 100.0 >= total * cfg.clutter_pct
+            {
                 self.prune();
             }
             let active = (live - settled) as f64;
@@ -387,7 +400,9 @@ impl Sim {
     /// Adopt a saved board. False (nothing changed) if the board is empty or
     /// was saved under a rule the config doesn't allow.
     pub fn restore(&mut self, saved: &Saved, cfg: &Config) -> bool {
-        let Some(rule) = crate::life::Rule::parse(&saved.rule) else { return false };
+        let Some(rule) = crate::life::Rule::parse(&saved.rule) else {
+            return false;
+        };
         if saved.cells.iter().all(|&c| c == 0) {
             return false;
         }
@@ -449,7 +464,10 @@ impl Sim {
             }
         };
         self.life.set_rule(rule);
-        self.life.seed(&mut self.rng, (cfg.reseed_density * rule.seed_scale()).min(0.9));
+        self.life.seed(
+            &mut self.rng,
+            (cfg.reseed_density * rule.seed_scale()).min(0.9),
+        );
         self.gen = 0;
         self.clear_queues();
         self.reset_stagnation();
@@ -474,7 +492,13 @@ mod tests {
     use crate::patterns::Pattern;
 
     fn quiet_cfg() -> Config {
-        Config { patterns: false, stamps: false, glider_min_secs: 100_000, glider_max_secs: 100_000, ..Config::default() }
+        Config {
+            patterns: false,
+            stamps: false,
+            glider_min_secs: 100_000,
+            glider_max_secs: 100_000,
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -520,12 +544,20 @@ mod tests {
         assert!(s.life.population() > 20, "never injected");
         assert_eq!(s.gen, ticks, "board was reset instead of added to");
         // the patch arrives over several generations, not in one pop
-        assert!(seen.len() >= 2 && seen[0] < 20, "population jumped: {seen:?}");
+        assert!(
+            seen.len() >= 2 && seen[0] < 20,
+            "population jumped: {seen:?}"
+        );
     }
 
     #[test]
     fn no_timed_reset_by_default() {
-        let cfg = Config { calm_pct: 0.0, clutter_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let cfg = Config {
+            calm_pct: 0.0,
+            clutter_pct: 0.0,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         let mut now = t0;
@@ -547,7 +579,10 @@ mod tests {
 
     #[test]
     fn clutter_prunes_settled_shapes_without_resetting() {
-        let cfg = Config { clutter_pct: 5.0, ..quiet_cfg() };
+        let cfg = Config {
+            clutter_pct: 5.0,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         s.life.clear();
@@ -560,13 +595,21 @@ mod tests {
         assert_eq!(s.gen, 200, "board was reset");
         let (_, settled) = s.life.census();
         assert!(settled > 0, "everything was wiped");
-        assert!((settled as f64) * 100.0 / 1200.0 < 5.0, "still cluttered: {settled}");
+        assert!(
+            (settled as f64) * 100.0 / 1200.0 < 5.0,
+            "still cluttered: {settled}"
+        );
         assert_eq!(settled % 4, 0, "shapes should be removed whole");
     }
 
     #[test]
     fn pruned_cells_leave_death_trails() {
-        let cfg = Config { clutter_pct: 5.0, trail: true, trail_length: 4, ..quiet_cfg() };
+        let cfg = Config {
+            clutter_pct: 5.0,
+            trail: true,
+            trail_length: 4,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         s.life.clear();
@@ -583,7 +626,12 @@ mod tests {
 
     #[test]
     fn sparse_settled_shapes_are_left_alone() {
-        let cfg = Config { clutter_pct: 5.0, calm_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let cfg = Config {
+            clutter_pct: 5.0,
+            calm_pct: 0.0,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         s.life.clear();
@@ -606,23 +654,38 @@ mod tests {
         let mut a = Sim::new(30, 20, Instant::now(), &cfg);
         a.life.clear();
         a.life.place(&Pattern::from_art(&["###"]), 4, 4, 0);
-        let saved = Saved { cols: 30, rows: 20, rule: a.life.rule().name(), cells: a.life.cells().to_vec(), age: a.life.age().to_vec() };
+        let saved = Saved {
+            cols: 30,
+            rows: 20,
+            rule: a.life.rule().name(),
+            cells: a.life.cells().to_vec(),
+            age: a.life.age().to_vec(),
+        };
 
         let mut b = Sim::new(30, 20, Instant::now(), &cfg);
         assert!(b.restore(&saved, &cfg));
         assert_eq!(b.life.cells(), a.life.cells());
 
-        let other = Config { rule: RuleSel::Fixed(crate::life::SEEDS), ..Config::default() };
+        let other = Config {
+            rule: RuleSel::Fixed(crate::life::SEEDS),
+            ..Config::default()
+        };
         let mut c = Sim::new(30, 20, Instant::now(), &other);
         assert!(!c.restore(&saved, &other)); // saved under life, config wants seeds
 
-        let empty = Saved { cells: vec![0; 600], ..saved };
+        let empty = Saved {
+            cells: vec![0; 600],
+            ..saved
+        };
         assert!(!b.restore(&empty, &cfg));
     }
 
     #[test]
     fn rotate_cycles_rules_on_reseed() {
-        let cfg = Config { rule: RuleSel::Rotate, ..Config::default() };
+        let cfg = Config {
+            rule: RuleSel::Rotate,
+            ..Config::default()
+        };
         let mut s = Sim::new(30, 30, Instant::now(), &cfg);
         let mut seen = vec![s.rule()];
         for _ in 0..4 {

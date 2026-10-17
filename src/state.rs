@@ -34,7 +34,13 @@ pub fn path_for(output: Option<&str>) -> Option<PathBuf> {
     let name: String = output
         .unwrap_or("default")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Some(state_dir()?.join(format!("{name}.board")))
 }
@@ -44,7 +50,13 @@ pub fn save(path: &Path, life: &Life) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut buf = format!("{MAGIC} {} {} {}\n", life.cols(), life.rows(), life.rule().name()).into_bytes();
+    let mut buf = format!(
+        "{MAGIC} {} {} {}\n",
+        life.cols(),
+        life.rows(),
+        life.rule().name()
+    )
+    .into_bytes();
     buf.extend_from_slice(life.cells());
     buf.extend_from_slice(life.age());
     let tmp = path.with_extension("tmp");
@@ -56,7 +68,10 @@ pub fn save(path: &Path, life: &Life) -> io::Result<()> {
 pub fn load(path: &Path) -> Option<Saved> {
     let data = fs::read(path).ok()?;
     let nl = data.iter().position(|&b| b == b'\n')?;
-    let head = std::str::from_utf8(&data[..nl]).ok()?.strip_prefix(MAGIC)?.trim();
+    let head = std::str::from_utf8(&data[..nl])
+        .ok()?
+        .strip_prefix(MAGIC)?
+        .trim();
     let mut it = head.splitn(3, ' ');
     let cols: usize = it.next()?.parse().ok()?;
     let rows: usize = it.next()?.parse().ok()?;
@@ -73,7 +88,13 @@ pub fn load(path: &Path) -> Option<Saved> {
     if cells.iter().any(|&c| c > 2) {
         return None;
     }
-    Some(Saved { cols, rows, rule, cells: cells.to_vec(), age: age.to_vec() })
+    Some(Saved {
+        cols,
+        rows,
+        rule,
+        cells: cells.to_vec(),
+        age: age.to_vec(),
+    })
 }
 
 #[cfg(test)]

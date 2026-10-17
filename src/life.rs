@@ -10,17 +10,29 @@ use crate::patterns::{self, Pattern};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Rule {
     /// Bit n of `birth`/`survive` set => n live neighbours triggers it.
-    LifeLike { birth: u16, survive: u16 },
+    LifeLike {
+        birth: u16,
+        survive: u16,
+    },
     Brain,
 }
 
-pub const CONWAY: Rule = Rule::LifeLike { birth: 1 << 3, survive: (1 << 2) | (1 << 3) };
-pub const HIGHLIFE: Rule = Rule::LifeLike { birth: (1 << 3) | (1 << 6), survive: (1 << 2) | (1 << 3) };
+pub const CONWAY: Rule = Rule::LifeLike {
+    birth: 1 << 3,
+    survive: (1 << 2) | (1 << 3),
+};
+pub const HIGHLIFE: Rule = Rule::LifeLike {
+    birth: (1 << 3) | (1 << 6),
+    survive: (1 << 2) | (1 << 3),
+};
 pub const DAY_NIGHT: Rule = Rule::LifeLike {
     birth: (1 << 3) | (1 << 6) | (1 << 7) | (1 << 8),
     survive: (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 8),
 };
-pub const SEEDS: Rule = Rule::LifeLike { birth: 1 << 2, survive: 0 };
+pub const SEEDS: Rule = Rule::LifeLike {
+    birth: 1 << 2,
+    survive: 0,
+};
 
 /// Order used by `rule = "rotate"`.
 pub const ROTATION: [Rule; 5] = [CONWAY, HIGHLIFE, DAY_NIGHT, SEEDS, Rule::Brain];
@@ -51,7 +63,10 @@ impl Rule {
             }
             Some(m)
         };
-        Some(Rule::LifeLike { birth: mask(b)?, survive: mask(sv)? })
+        Some(Rule::LifeLike {
+            birth: mask(b)?,
+            survive: mask(sv)?,
+        })
     }
 
     pub fn name(&self) -> String {
@@ -62,7 +77,12 @@ impl Rule {
             r if r == SEEDS => "seeds".into(),
             Rule::Brain => "brain".into(),
             Rule::LifeLike { birth, survive } => {
-                let digits = |m: u16| (0..=8).filter(|n| m >> n & 1 == 1).map(|n| n.to_string()).collect::<String>();
+                let digits = |m: u16| {
+                    (0..=8)
+                        .filter(|n| m >> n & 1 == 1)
+                        .map(|n| n.to_string())
+                        .collect::<String>()
+                };
                 format!("b{}/s{}", digits(birth), digits(survive))
             }
         }
@@ -271,7 +291,14 @@ impl Life {
                 let l = if x == 0 { cols - 1 } else { x - 1 };
                 let r = if x + 1 == cols { 0 } else { x + 1 };
                 let on = |i: usize| (cur[i] == 1) as u8;
-                let n = on(up + l) + on(up + x) + on(up + r) + on(row + l) + on(row + r) + on(down + l) + on(down + x) + on(down + r);
+                let n = on(up + l)
+                    + on(up + x)
+                    + on(up + r)
+                    + on(row + l)
+                    + on(row + r)
+                    + on(down + l)
+                    + on(down + x)
+                    + on(down + r);
                 let c = cur[row + x];
                 let v = match c {
                     0 => (n == 2) as u8,
@@ -319,13 +346,22 @@ impl Life {
         let (x1, y1) = ((x + w).min(self.cols), (y + h).min(self.rows));
         let mut n = 0;
         for yy in y..y1 {
-            n += self.cur[yy * self.cols + x..yy * self.cols + x1].iter().filter(|&&c| c != 0).count();
+            n += self.cur[yy * self.cols + x..yy * self.cols + x1]
+                .iter()
+                .filter(|&&c| c != 0)
+                .count();
         }
         n
     }
 
     /// Top-left of the emptiest of `tries` random `w` x `h` rectangles.
-    pub fn emptiest_spot<R: Rng>(&self, rng: &mut R, w: usize, h: usize, tries: usize) -> (usize, usize) {
+    pub fn emptiest_spot<R: Rng>(
+        &self,
+        rng: &mut R,
+        w: usize,
+        h: usize,
+        tries: usize,
+    ) -> (usize, usize) {
         let (w, h) = (w.min(self.cols), h.min(self.rows));
         let mut best = (0, 0);
         let mut best_n = usize::MAX;
@@ -343,7 +379,15 @@ impl Life {
 
     /// Indices of currently empty cells in a rectangle, each picked with
     /// probability `density`. Used to drip a soup patch in over a few ticks.
-    pub fn soup_cells<R: Rng>(&self, rng: &mut R, x: usize, y: usize, w: usize, h: usize, density: f64) -> Vec<usize> {
+    pub fn soup_cells<R: Rng>(
+        &self,
+        rng: &mut R,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        density: f64,
+    ) -> Vec<usize> {
         let d = density.clamp(0.0, 1.0);
         let mut out = Vec::new();
         for yy in y..(y + h).min(self.rows) {
@@ -502,7 +546,13 @@ impl Life {
     }
 
     /// Place at a random position with at least `margin` free cells to the border.
-    pub fn place_random<R: Rng>(&mut self, rng: &mut R, pat: &Pattern, margin: usize, clear: usize) -> bool {
+    pub fn place_random<R: Rng>(
+        &mut self,
+        rng: &mut R,
+        pat: &Pattern,
+        margin: usize,
+        clear: usize,
+    ) -> bool {
         if pat.w + 2 * margin > self.cols || pat.h + 2 * margin > self.rows {
             return false;
         }
@@ -580,7 +630,7 @@ mod tests {
         let mut l = Life::new(8, 8, 0, Rule::Brain);
         l.place(&Pattern::from_art(&["##"]), 3, 3, 0);
         l.step();
-        assert!(l.cells().iter().any(|&c| c == 2));
+        assert!(l.cells().contains(&2));
         assert_eq!(l.cells().iter().filter(|&&c| c == 2).count(), 2);
     }
 
@@ -661,7 +711,13 @@ mod tests {
 
     #[test]
     fn load_copies_overlap() {
-        let saved = crate::state::Saved { cols: 4, rows: 4, rule: "life".into(), cells: (0..16).map(|i| (i == 5) as u8).collect(), age: vec![7; 16] };
+        let saved = crate::state::Saved {
+            cols: 4,
+            rows: 4,
+            rule: "life".into(),
+            cells: (0..16).map(|i| (i == 5) as u8).collect(),
+            age: vec![7; 16],
+        };
         let mut l = Life::new(8, 2, 0, CONWAY);
         l.load(&saved);
         assert_eq!(l.cells()[8 + 1], 1);

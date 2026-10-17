@@ -77,19 +77,29 @@ impl Renderer {
         };
         let mut pal = vec![[0u8; 3]; 22];
         pal[IDX_BG as usize] = p.bg;
-        for (i, c) in [p.newborn, p.mature, p.old, p.ancient].into_iter().enumerate() {
+        for (i, c) in [p.newborn, p.mature, p.old, p.ancient]
+            .into_iter()
+            .enumerate()
+        {
             pal[IDX_AGE0 as usize + i] = c;
         }
         pal[IDX_DYING as usize] = p.dying;
         pal[IDX_FIXED as usize] = live;
         pal[IDX_OVERLAY as usize] = p.overlay;
         for i in 0..TRAIL_STEPS {
-            pal[IDX_TRAIL0 as usize + i] = blend(live, p.bg, 0.5 * (i + 1) as f32 / TRAIL_STEPS as f32);
+            pal[IDX_TRAIL0 as usize + i] =
+                blend(live, p.bg, 0.5 * (i + 1) as f32 / TRAIL_STEPS as f32);
         }
         for i in 0..RAIN_STEPS {
-            pal[IDX_RAIN0 as usize + i] = blend(p.rain, p.bg, 0.5 * (i + 1) as f32 / RAIN_STEPS as f32);
+            pal[IDX_RAIN0 as usize + i] =
+                blend(p.rain, p.bg, 0.5 * (i + 1) as f32 / RAIN_STEPS as f32);
         }
-        Self { pal, font: Font::build(), fixed, round: cfg.cell_round }
+        Self {
+            pal,
+            font: Font::build(),
+            fixed,
+            round: cfg.cell_round,
+        }
     }
 
     fn key(&self, idx: u8, glyph: u8) -> Key {
@@ -118,11 +128,17 @@ impl Renderer {
                 _ => {
                     let t = trail[i] as usize;
                     if t > 0 {
-                        let step = (t * TRAIL_STEPS).div_ceil(tl).saturating_sub(1).min(TRAIL_STEPS - 1);
+                        let step = (t * TRAIL_STEPS)
+                            .div_ceil(tl)
+                            .saturating_sub(1)
+                            .min(TRAIL_STEPS - 1);
                         self.key(IDX_TRAIL0 + step as u8, 0)
                     } else if let Some(r) = rain.filter(|r| r.level()[i] > 0) {
                         let l = r.level()[i] as usize;
-                        let step = (l * RAIN_STEPS).div_ceil(RAIN_LEVELS as usize).saturating_sub(1).min(RAIN_STEPS - 1);
+                        let step = (l * RAIN_STEPS)
+                            .div_ceil(RAIN_LEVELS as usize)
+                            .saturating_sub(1)
+                            .min(RAIN_STEPS - 1);
                         self.key(IDX_RAIN0 + step as u8, r.glyph()[i])
                     } else {
                         self.key(IDX_BG, 0)
@@ -133,7 +149,13 @@ impl Renderer {
 
         if cfg.overlay {
             let (cols, rows) = (life.cols(), life.rows());
-            let text = format!("gen {} pop {} {} {:.0}hz", sim.gen, life.population(), life.rule().name(), hz);
+            let text = format!(
+                "gen {} pop {} {} {:.0}hz",
+                sim.gen,
+                life.population(),
+                life.rule().name(),
+                hz
+            );
             let row = if rows >= 3 { rows - 2 } else { 0 };
             for (n, c) in text.bytes().enumerate() {
                 let col = 1 + n;
@@ -142,7 +164,11 @@ impl Renderer {
                 }
                 let g = if self.font.has(c) && c != b' ' { c } else { 0 };
                 // A blank overlay cell is a plain bg cell, so the line reads as one block of text.
-                out[row * cols + col] = if g == 0 { self.key(IDX_BG, 0) } else { self.key(IDX_OVERLAY, g) };
+                out[row * cols + col] = if g == 0 {
+                    self.key(IDX_BG, 0)
+                } else {
+                    self.key(IDX_OVERLAY, g)
+                };
             }
         }
     }
@@ -158,11 +184,19 @@ impl Renderer {
         let stride = t.w * 4;
         // Glyph cells (rain, overlay text) keep the full cell so text stays
         // legible; plain cells are an inset (optionally rounded) square.
-        let gap = if glyph == 0 { t.gap.min(t.cell.saturating_sub(1)) } else { 0 };
+        let gap = if glyph == 0 {
+            t.gap.min(t.cell.saturating_sub(1))
+        } else {
+            0
+        };
         let side = t.cell - gap;
         let lead = gap / 2; // gap is split between the leading and trailing edge
-        // ~0.4 of the side: at 7-8px that trims the corner pixels, on big cells it is a real curve
-        let radius = if self.round && glyph == 0 { ((side as f32 * 0.4).ceil() as usize).clamp(1, (side / 2).max(1)) } else { 0 };
+                            // ~0.4 of the side: at 7-8px that trims the corner pixels, on big cells it is a real curve
+        let radius = if self.round && glyph == 0 {
+            ((side as f32 * 0.4).ceil() as usize).clamp(1, (side / 2).max(1))
+        } else {
+            0
+        };
         for y in y0..y1 {
             let row = &mut t.canvas[y * stride..(y + 1) * stride];
             for x in x0..x1 {
@@ -239,8 +273,20 @@ fn in_square(x: usize, y: usize, lead: usize, side: usize, radius: usize) -> boo
     let (lx, ly) = ((x - lead) as f32 + 0.5, (y - lead) as f32 + 0.5);
     let (s, r) = (side as f32, radius as f32);
     // distance past the corner-circle centre, per axis (0 inside the straight part)
-    let dx = if lx < r { r - lx } else if lx > s - r { lx - (s - r) } else { 0.0 };
-    let dy = if ly < r { r - ly } else if ly > s - r { ly - (s - r) } else { 0.0 };
+    let dx = if lx < r {
+        r - lx
+    } else if lx > s - r {
+        lx - (s - r)
+    } else {
+        0.0
+    };
+    let dy = if ly < r {
+        r - ly
+    } else if ly > s - r {
+        ly - (s - r)
+    } else {
+        0.0
+    };
     dx * dx + dy * dy <= r * r
 }
 
@@ -259,7 +305,14 @@ pub struct Fade {
 
 impl Fade {
     pub fn new(n: usize, now: Instant) -> Self {
-        Self { from: vec![0; n], to: vec![0; n], changing: Vec::new(), start: now, dur: Duration::ZERO, active: false }
+        Self {
+            from: vec![0; n],
+            to: vec![0; n],
+            changing: Vec::new(),
+            start: now,
+            dur: Duration::ZERO,
+            active: false,
+        }
     }
 
     pub fn target_mut(&mut self) -> &mut [Key] {
@@ -301,11 +354,16 @@ impl Fade {
         if !self.active {
             return false;
         }
-        let x = now.saturating_duration_since(self.start).as_secs_f32() / self.dur.as_secs_f32().max(1e-3);
+        let x = now.saturating_duration_since(self.start).as_secs_f32()
+            / self.dur.as_secs_f32().max(1e-3);
         let t = x.clamp(0.0, 1.0);
         let e = t * t * (3.0 - 2.0 * t); // smoothstep
         for &i in &self.changing {
-            display[i] = if t >= 1.0 { self.to[i] } else { blend_keys(self.from[i], self.to[i], e) };
+            display[i] = if t >= 1.0 {
+                self.to[i]
+            } else {
+                blend_keys(self.from[i], self.to[i], e)
+            };
         }
         if t >= 1.0 {
             self.active = false;
@@ -353,17 +411,41 @@ mod tests {
         let mut display = vec![r.key(IDX_BG, 0); cols * rows];
         let mut dmg = Vec::new();
 
-        let mut t = Target { canvas: &mut canvas, w, h, cell, gap: 0, cols, rows };
+        let mut t = Target {
+            canvas: &mut canvas,
+            w,
+            h,
+            cell,
+            gap: 0,
+            cols,
+            rows,
+        };
         r.draw(&mut t, &display, &mut shown, &mut presented, &mut dmg);
         assert_eq!(dmg.len(), rows); // first frame: every row damaged
 
         display[cols + 1] = r.key(IDX_AGE0, 0);
-        let mut t = Target { canvas: &mut canvas, w, h, cell, gap: 0, cols, rows };
+        let mut t = Target {
+            canvas: &mut canvas,
+            w,
+            h,
+            cell,
+            gap: 0,
+            cols,
+            rows,
+        };
         r.draw(&mut t, &display, &mut shown, &mut presented, &mut dmg);
         assert_eq!(dmg, vec![[8, 8, 8, 8]]);
 
         // Nothing changed: nothing damaged.
-        let mut t = Target { canvas: &mut canvas, w, h, cell, gap: 0, cols, rows };
+        let mut t = Target {
+            canvas: &mut canvas,
+            w,
+            h,
+            cell,
+            gap: 0,
+            cols,
+            rows,
+        };
         r.draw(&mut t, &display, &mut shown, &mut presented, &mut dmg);
         assert!(dmg.is_empty());
     }
@@ -378,10 +460,22 @@ mod tests {
         let (w, h, cell) = (16usize, 8usize, 8usize);
         let live = [200u8, 100, 50];
         let draw = |gap: usize, round: bool| {
-            let cfg = Config { cell_round: round, color: ColorMode::Fixed(live), ..Config::default() };
+            let cfg = Config {
+                cell_round: round,
+                color: ColorMode::Fixed(live),
+                ..Config::default()
+            };
             let r = Renderer::new(&cfg);
             let mut canvas = vec![0u8; w * h * 4];
-            let mut t = Target { canvas: &mut canvas, w, h, cell, gap, cols: 2, rows: 1 };
+            let mut t = Target {
+                canvas: &mut canvas,
+                w,
+                h,
+                cell,
+                gap,
+                cols: 2,
+                rows: 1,
+            };
             r.draw_cell(&mut t, 0, 0, r.key(IDX_FIXED, 0));
             (canvas, r.pal[IDX_BG as usize])
         };
@@ -408,14 +502,19 @@ mod tests {
 
     #[test]
     fn compose_produces_age_colors_and_overlay() {
-        let cfg = Config { overlay: true, ..Config::default() };
+        let cfg = Config {
+            overlay: true,
+            ..Config::default()
+        };
         let r = Renderer::new(&cfg);
         let sim = Sim::new(60, 10, Instant::now(), &cfg);
         let mut out = vec![0; 600];
         r.compose(&sim, &cfg, 4.0, &mut out);
         let newborn = pack(cfg.palette.newborn, 0);
-        assert!(out.iter().any(|&k| k == newborn)); // newborn soup
-        assert!(out.iter().any(|&k| key_glyph(k) != 0 && key_rgb(k) == cfg.palette.overlay));
+        assert!(out.contains(&newborn)); // newborn soup
+        assert!(out
+            .iter()
+            .any(|&k| key_glyph(k) != 0 && key_rgb(k) == cfg.palette.overlay));
     }
 
     #[test]
@@ -452,7 +551,11 @@ mod tests {
     #[test]
     fn fade_restarts_from_what_is_shown_and_smooth_off_snaps() {
         let t0 = Instant::now();
-        let (a, b, c) = (pack([0, 0, 0], 0), pack([100, 100, 100], 0), pack([200, 200, 200], 0));
+        let (a, b, c) = (
+            pack([0, 0, 0], 0),
+            pack([100, 100, 100], 0),
+            pack([200, 200, 200], 0),
+        );
         let mut display = vec![a];
         let mut f = Fade::new(1, t0);
         f.target_mut()[0] = b;
@@ -460,7 +563,12 @@ mod tests {
         f.step(t0 + Duration::from_millis(50), &mut display);
         let shown = display[0];
         f.target_mut()[0] = c;
-        f.begin(&mut display, t0 + Duration::from_millis(50), Duration::from_millis(100), true);
+        f.begin(
+            &mut display,
+            t0 + Duration::from_millis(50),
+            Duration::from_millis(100),
+            true,
+        );
         assert_eq!(display[0], shown); // no jump when a new generation lands mid-fade
         f.begin(&mut display, t0, Duration::from_millis(100), false);
         assert_eq!(display[0], c);

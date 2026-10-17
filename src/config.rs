@@ -56,7 +56,7 @@ pub struct Config {
     /// How long the board must stay calm before new life is injected.
     pub stagnation_secs: u64,
     /// Percent of the grid taken up by settled shapes (still lifes,
-    /// oscillators) at which a full reset happens. 0 = never.
+    /// oscillators) at which some of them are pruned. 0 = never.
     pub clutter_pct: f64,
     /// Board counts as calm while moving/chaotic cells are below this
     /// percent of the grid. 0 = only a fully repeating board is calm.
@@ -129,7 +129,18 @@ impl Default for Config {
     }
 }
 
-pub const BOOL_KEYS: &[&str] = &["trail", "rain", "overlay", "sysload", "patterns", "stamps", "smooth", "persist", "pause_hidden", "cell_round"];
+pub const BOOL_KEYS: &[&str] = &[
+    "trail",
+    "rain",
+    "overlay",
+    "sysload",
+    "patterns",
+    "stamps",
+    "smooth",
+    "persist",
+    "pause_hidden",
+    "cell_round",
+];
 
 pub fn parse_color(s: &str) -> Result<Rgb, String> {
     let named = match s.to_ascii_lowercase().as_str() {
@@ -163,9 +174,14 @@ fn parse_bool(s: &str) -> Result<bool, String> {
     }
 }
 
-fn num<T: std::str::FromStr + PartialOrd + std::fmt::Display>(s: &str, lo: T, hi: T) -> Result<T, String> {
+fn num<T: std::str::FromStr + PartialOrd + std::fmt::Display>(
+    s: &str,
+    lo: T,
+    hi: T,
+) -> Result<T, String> {
     let v: T = s.parse().map_err(|_| format!("bad number {s:?}"))?;
-    if v < lo || v > hi {
+    // `partial_cmp` is None for NaN, which `<` / `>` would let straight through.
+    if v.partial_cmp(&lo).is_none() || v < lo || v > hi {
         return Err(format!("{s} out of range {lo}..={hi}"));
     }
     Ok(v)
@@ -196,7 +212,11 @@ impl Config {
                 }
             }
             "color" => {
-                self.color = if val.eq_ignore_ascii_case("age") { ColorMode::Age } else { ColorMode::Fixed(parse_color(val)?) }
+                self.color = if val.eq_ignore_ascii_case("age") {
+                    ColorMode::Age
+                } else {
+                    ColorMode::Fixed(parse_color(val)?)
+                }
             }
             "trail" => self.trail = parse_bool(val)?,
             "trail_length" => self.trail_length = num(val, 1, 32)?,
@@ -241,10 +261,16 @@ impl Config {
             if line.is_empty() || line.starts_with('[') {
                 continue;
             }
-            let (k, v) = line.split_once('=').ok_or_else(|| format!("line {}: expected key = value", n + 1))?;
+            let (k, v) = line
+                .split_once('=')
+                .ok_or_else(|| format!("line {}: expected key = value", n + 1))?;
             let v = v.trim();
-            let v = v.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(v);
-            self.set(k.trim(), v).map_err(|e| format!("line {}: {e}", n + 1))?;
+            let v = v
+                .strip_prefix('"')
+                .and_then(|x| x.strip_suffix('"'))
+                .unwrap_or(v);
+            self.set(k.trim(), v)
+                .map_err(|e| format!("line {}: {e}", n + 1))?;
         }
         if self.glider_min_secs > self.glider_max_secs {
             return Err("glider_min_secs > glider_max_secs".into());
@@ -292,7 +318,8 @@ impl ConfigSource {
                 "minimal" => include_str!("../config_example/minimal.toml"),
                 _ => return Err(format!("unknown preset {name:?} (choose default, ambient, matrix-rain, neon-brain, or minimal)")),
             };
-            cfg.apply_toml(text).map_err(|e| format!("preset {name}: {e}"))?;
+            cfg.apply_toml(text)
+                .map_err(|e| format!("preset {name}: {e}"))?;
         }
         let (path, explicit) = match &self.path {
             Some(p) => (Some(p.clone()), true),
@@ -300,15 +327,16 @@ impl ConfigSource {
         };
         if let Some(p) = path {
             match std::fs::read_to_string(&p) {
-                Ok(text) if self.preset.is_none() || explicit => {
-                    cfg.apply_toml(&text).map_err(|e| format!("{}: {e}", p.display()))?
-                }
-                Ok(_) => {},
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(text) if self.preset.is_none() || explicit => cfg
+                    .apply_toml(&text)
+                    .map_err(|e| format!("{}: {e}", p.display()))?,
+                Ok(_) => {}
+                Err(e) if !explicit && e.kind() == std::io::ErrorKind::NotFound => {
                     // Ship the template in the binary so first-run setup also works
                     // when the executable is launched outside the source directory.
                     let template = include_str!("../config_example/config.default.toml");
-                    let create_result = p.parent()
+                    let create_result = p
+                        .parent()
                         .map(std::fs::create_dir_all)
                         .transpose()
                         .and_then(|_| std::fs::write(&p, template));
@@ -316,7 +344,8 @@ impl ConfigSource {
                         Ok(()) => {
                             eprintln!("life-wallpaper: created default config at {}", p.display());
                             if self.preset.is_none() {
-                                cfg.apply_toml(template).map_err(|e| format!("embedded default config: {e}"))?;
+                                cfg.apply_toml(template)
+                                    .map_err(|e| format!("embedded default config: {e}"))?;
                             }
                         }
                         Err(create_err) => {
@@ -334,7 +363,8 @@ impl ConfigSource {
             }
         }
         for (k, v) in &self.cli {
-            cfg.set(k, v).map_err(|e| format!("--{}: {e}", k.replace('_', "-")))?;
+            cfg.set(k, v)
+                .map_err(|e| format!("--{}: {e}", k.replace('_', "-")))?;
         }
         if cfg.glider_min_secs > cfg.glider_max_secs {
             return Err("glider_min_secs > glider_max_secs".into());
@@ -357,7 +387,8 @@ usage: life-wallpaper [options]
       --list-outputs      print output names and exit
       --config PATH       config file (default: $XDG_CONFIG_HOME/life-wallpaper/config.toml)
       --preset NAME       default | ambient | matrix-rain | neon-brain | minimal
-                          preset values are overridden by config file, then CLI flags
+                          a preset replaces the default config file (an explicit --config
+                          still applies on top of it); CLI flags override both
       --cell-size PX      cell size in logical pixels (default 8)
       --fps HZ            generations per second (default 4)
       --density 0..1      soup density for startup and reseeds (default 0.25 / 0.30)
@@ -381,7 +412,10 @@ SIGHUP reloads the config file. Any option can also be set in the config as key 
 (use underscores: cell_size = 10). See the README comments in config.rs for all keys.";
 
 pub fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
-    let mut cli = Cli { source: ConfigSource::default(), list_outputs: false };
+    let mut cli = Cli {
+        source: ConfigSource::default(),
+        list_outputs: false,
+    };
     let mut args = args.peekable();
     while let Some(a) = args.next() {
         if a == "-h" || a == "--help" {
@@ -413,14 +447,19 @@ pub fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         }
         let val = match inline {
             Some(v) => v,
-            None => args.next().ok_or_else(|| format!("--{name} requires a value"))?,
+            None => args
+                .next()
+                .ok_or_else(|| format!("--{name} requires a value"))?,
         };
         if key == "config" {
             cli.source.path = Some(PathBuf::from(val));
         } else if key == "preset" {
             let valid = ["default", "ambient", "matrix-rain", "neon-brain", "minimal"];
             if !valid.contains(&val.as_str()) {
-                return Err(format!("unknown preset {val:?} (choose {})", valid.join(", ")));
+                return Err(format!(
+                    "unknown preset {val:?} (choose {})",
+                    valid.join(", ")
+                ));
             }
             cli.source.preset = Some(val);
         } else {
@@ -443,6 +482,8 @@ mod tests {
         assert_eq!(c.palette.bg, [0x1d, 0x20, 0x21]);
         assert!(c.apply_toml("bogus = 1").is_err());
         assert!(c.apply_toml("cell_size = 1000").is_err());
+        assert!(c.apply_toml("fps = nan").is_err());
+        assert!(c.apply_toml("fps = inf").is_err());
     }
 
     #[test]
@@ -454,7 +495,17 @@ mod tests {
 
     #[test]
     fn cli_flags() {
-        let args = ["--cell-size", "12", "--no-trail", "--rain", "--rule=seeds", "-o", "DP-1", "--color", "yellow"];
+        let args = [
+            "--cell-size",
+            "12",
+            "--no-trail",
+            "--rain",
+            "--rule=seeds",
+            "-o",
+            "DP-1",
+            "--color",
+            "yellow",
+        ];
         let cli = parse_cli(args.iter().map(|s| s.to_string())).unwrap();
         let mut cfg = Config::default();
         for (k, v) in &cli.source.cli {

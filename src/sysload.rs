@@ -25,7 +25,11 @@ pub fn parse_cpu_line(line: &str) -> Option<(u64, u64)> {
 
 impl CpuLoad {
     pub fn new() -> Self {
-        Self { prev: None, ema: 0.0, buf: String::new() }
+        Self {
+            prev: None,
+            ema: 0.0,
+            buf: String::new(),
+        }
     }
 
     /// 0.0 (idle) ..= 1.0 (all cores busy).
@@ -36,11 +40,15 @@ impl CpuLoad {
     pub fn sample(&mut self) {
         use std::io::Read;
         self.buf.clear();
-        let ok = std::fs::File::open("/proc/stat").and_then(|mut f| f.read_to_string(&mut self.buf)).is_ok();
+        let ok = std::fs::File::open("/proc/stat")
+            .and_then(|mut f| f.read_to_string(&mut self.buf))
+            .is_ok();
         if !ok {
             return;
         }
-        let Some((idle, total)) = self.buf.lines().next().and_then(parse_cpu_line) else { return };
+        let Some((idle, total)) = self.buf.lines().next().and_then(parse_cpu_line) else {
+            return;
+        };
         if let Some((pi, pt)) = self.prev {
             let (di, dt) = (idle.saturating_sub(pi), total.saturating_sub(pt));
             if dt > 0 {
