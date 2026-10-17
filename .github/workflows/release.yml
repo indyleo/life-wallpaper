@@ -1,8 +1,5 @@
 name: Release
 
-# Releases are cut automatically: push to main with a new version in Cargo.toml
-# and v<version> is tagged and released. If that tag already exists, nothing runs.
-# Pushing a v* tag by hand, or "Run workflow", also works.
 on:
   push:
     branches: ["main"]
@@ -10,16 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build, e.g. v0.1.0 (leave empty to release the Cargo.toml version from the selected branch)"
+        description: "Existing tag to rebuild, e.g. v0.1.0 (leave empty to release the Cargo.toml version)"
         required: false
+        type: string
 
 permissions:
-  contents: write # create the tag + GitHub Release
-  id-token: write # build provenance attestation
-  attestations: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -28,130 +24,238 @@ env:
 
 jobs:
   prepare:
-    name: decide tag
+    name: Decide release
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.v.outputs.tag }}
-      skip: ${{ steps.v.outputs.skip }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.sha }}
-          fetch-depth: 0
+      tag: ${{ steps.version.outputs.tag }}
+      skip: ${{ steps.version.outputs.skip }}
+      commit_sha: ${{ steps.version.outputs.commit_sha }}
 
-      - name: Work out the tag
-        id: v
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine release tag and commit
+        id: version
         shell: bash
+        env:
+          EXPLICIT_TAG: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          explicit="${{ github.event.inputs.tag }}"
-          if [ -z "$explicit" ] && [ "${{ github.ref_type }}" = "tag" ]; then
-            explicit="${{ github.ref_name }}"
+
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -er '.packages[] | select(.name == "life-wallpaper") | .version' \
+            | head -n 1)"
+
+          explicit="$EXPLICIT_TAG"
+
+          if [[ -z "$explicit" && "$REF_TYPE" == "tag" ]]; then
+            explicit="$REF_NAME"
           fi
 
-          if [ -n "$explicit" ]; then
-            # Hand-pushed or manually requested tag: it must match Cargo.toml.
-            if [ "${explicit#v}" != "$version" ]; then
-              echo "::error::tag $explicit does not match Cargo.toml version $version"
+          if [[ -n "$explicit" ]]; then
+            if [[ ! "$explicit" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::Invalid release tag: $explicit"
               exit 1
             fi
-            echo "tag=$explicit" >> "$GITHUB_OUTPUT"
+
+            if [[ "${explicit#v}" != "$version" ]]; then
+              echo "::error::Tag $explicit does not match Cargo.toml version $version"
+              exit 1
+            fi
+
+            if ! git check-ref-format "refs/tags/$explicit"; then
+              echo "::error::Invalid Git tag: $explicit"
+              exit 1
+            fi
+
+            tag="$explicit"
+          else
+            tag="v$version"
+          fi
+
+          commit_sha="$(git rev-parse HEAD)"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+
+          # Explicit tags and tag-triggered runs are intentional rebuilds.
+          if [[ -n "$explicit" ]]; then
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Push to main: release v<version> unless it was already released.
-          tag="v$version"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-            echo "Tag $tag already exists; bump the version in Cargo.toml to release again."
+          if git ls-remote --exit-code --tags origin \
+            "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; bump Cargo.toml to release again."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
-    name: build ${{ matrix.target }}
+  check:
+    name: Test and lint
     needs: prepare
     if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [prepare, check]
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: ${{ matrix.os }}
+
     strategy:
-      fail-fast: false # one arch failing must not kill the other
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          # Native arm64 runner: avoids cross + a missing Wayland sysroot.
-          # (Free on public repos only.)
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.sha }}
-          fetch-depth: 0
 
-      - name: Install Wayland build deps
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Install Wayland build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwayland-dev pkg-config
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
+      - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package release
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          tag="${{ needs.prepare.outputs.tag }}"
-          name="${BIN}-${tag}-${{ matrix.target }}"
+
+          name="${BIN}-${RELEASE_TAG}-${TARGET}"
           stage="dist/$name"
+
           mkdir -p "$stage"
-          cp "target/${{ matrix.target }}/release/${BIN}" "$stage/"
+
+          cp "target/$TARGET/release/$BIN" "$stage/"
           cp README.md LICENSE "$stage/"
           cp man/life-wallpaper.1 "$stage/"
           cp -r config_example "$stage/"
+
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
-          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+          (
+            cd dist
+            sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+            sha256sum -c "${name}.tar.gz.sha256"
+          )
+
+          tar -tzf "dist/${name}.tar.gz"
+
+          test -s "target/$TARGET/release/$BIN"
+          file "target/$TARGET/release/$BIN"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/*.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+          retention-days: 7
 
   release:
-    needs: [prepare, build]
+    name: Publish GitHub Release
+    needs: [prepare, check, build]
     if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      # Creates the tag on the built commit if it doesn't exist yet.
-      - uses: softprops/action-gh-release@v2
+      - name: Verify all checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          checksums=(dist/*.tar.gz.sha256)
+
+          if (( ${#checksums[@]} == 0 )); then
+            echo "::error::No checksum files found"
+            exit 1
+          fi
+
+          for checksum in "${checksums[@]}"; do
+            (
+              cd dist
+              sha256sum -c "$(basename "$checksum")"
+            )
+          done
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ needs.prepare.outputs.commit_sha }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
-            dist/*.sha256
+            dist/*.tar.gz.sha256
