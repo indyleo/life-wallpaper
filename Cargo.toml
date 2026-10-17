@@ -1,13 +1,15 @@
 [package]
 name = "life-wallpaper"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Conway's Game of Life as a native Wayland wallpaper (wlr-layer-shell, wl_shm)"
 
 [dependencies]
 # `calloop` feature gives us the calloop + calloop-wayland-source re-exports.
 # Default features are off so we don't pull in xkbcommon (no keyboard needed).
-smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop"] }
+smithay-client-toolkit = { version = "0.19", default-features = false, features = [
+	"calloop",
+] }
 # Same calloop SCTK uses; we only add the `signals` feature (signalfd source).
 calloop = { version = "0.13", features = ["signals"] }
 rand = "0.8"
@@ -17,3 +19,4 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+

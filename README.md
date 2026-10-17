@@ -89,6 +89,7 @@ pkill -HUP life-wallpaper
 ## License
 
 MIT
+
 ## Example configurations
 
 The `config_example/` directory includes optional presets you can try:

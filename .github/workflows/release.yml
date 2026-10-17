@@ -1,21 +1,25 @@
 name: Release
 
+# Releases are cut automatically: push to main with a new version in Cargo.toml
+# and v<version> is tagged and released. If that tag already exists, nothing runs.
+# Pushing a v* tag by hand, or "Run workflow", also works.
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build, e.g. v0.1.0"
-        required: true
+        description: "Existing tag to (re)build, e.g. v0.1.0 (leave empty to release the Cargo.toml version from the selected branch)"
+        required: false
 
 permissions:
-  contents: write # create/update the GitHub Release
+  contents: write # create the tag + GitHub Release
   id-token: write # build provenance attestation
   attestations: write
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ github.event.inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -23,8 +27,54 @@ env:
   BIN: life-wallpaper
 
 jobs:
+  prepare:
+    name: decide tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      skip: ${{ steps.v.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.sha }}
+          fetch-depth: 0
+
+      - name: Work out the tag
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          explicit="${{ github.event.inputs.tag }}"
+          if [ -z "$explicit" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            explicit="${{ github.ref_name }}"
+          fi
+
+          if [ -n "$explicit" ]; then
+            # Hand-pushed or manually requested tag: it must match Cargo.toml.
+            if [ "${explicit#v}" != "$version" ]; then
+              echo "::error::tag $explicit does not match Cargo.toml version $version"
+              exit 1
+            fi
+            echo "tag=$explicit" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Push to main: release v<version> unless it was already released.
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; bump the version in Cargo.toml to release again."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false # one arch failing must not kill the other
@@ -33,12 +83,13 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           # Native arm64 runner: avoids cross + a missing Wayland sysroot.
+          # (Free on public repos only.)
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.tag || github.sha }}
           fetch-depth: 0
 
       - name: Install Wayland build deps
@@ -55,17 +106,6 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Verify tag matches Cargo.toml
-        shell: bash
-        run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          want="${tag#v}"
-          got="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          if [ "$want" != "$got" ]; then
-            echo "::error::tag $tag does not match Cargo.toml version $got"
-            exit 1
-          fi
-
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -73,7 +113,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="${{ needs.prepare.outputs.tag }}"
           name="${BIN}-${tag}-${{ matrix.target }}"
           stage="dist/$name"
           mkdir -p "$stage"
@@ -96,7 +136,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -104,9 +145,11 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Creates the tag on the built commit if it doesn't exist yet.
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
