@@ -135,6 +135,11 @@ jobs:
     if: needs.prepare.outputs.skip != 'true'
     runs-on: ${{ matrix.os }}
 
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
     strategy:
       fail-fast: false
       matrix:
