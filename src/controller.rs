@@ -1,17 +1,19 @@
 //! Policy layer, one `Sim` per output: owns the automaton, the code-rain layer
 //! and every timer (optional soft reset, calm detection, gliders, specials,
-//! stamps). A calm board gets new life injected; a full reset only happens
-//! when settled shapes clog the grid (or the optional timer fires).
+//! stamps). A calm board gets new life dripped in over a few ticks; settled
+//! shapes that clog the grid are pruned (whole shapes, over a few ticks, so
+//! they fade out) instead of wiping the board.
 //! Pure logic driven by `tick(now, ..)`; no Wayland in here.
 
 use std::time::{Duration, Instant};
 
-use rand::{rngs::ThreadRng, Rng};
+use rand::{rngs::ThreadRng, seq::SliceRandom, Rng};
 
 use crate::config::{Config, RuleSel};
 use crate::font::Font;
 use crate::life::{Life, ROTATION};
 use crate::patterns;
+use crate::state::Saved;
 
 /// How many recent generation hashes count as "already seen".
 /// 1  = literal "grid unchanged since last tick" (still lifes only).
@@ -21,6 +23,12 @@ const HISTORY: usize = 16;
 
 /// Run the settled-shape census every this many generations.
 const CENSUS_EVERY: u64 = 8;
+
+/// Soup patches and prunes are spread over this many generations.
+const DRIP_TICKS: u32 = 8;
+
+/// Share of the settled cells a prune removes (in whole shapes).
+const PRUNE_FRACTION: f64 = 0.5;
 
 pub const RAIN_LEVELS: u8 = 8;
 
@@ -104,6 +112,18 @@ pub struct Sim {
     hist_pos: usize,
     stagnant_since: Option<Instant>,
     calm_since: Option<Instant>,
+    /// Cells still to be born / erased, drained a few per generation.
+    spawn: Vec<usize>,
+    spawn_ticks: u32,
+    erase: Vec<usize>,
+    erase_ticks: u32,
+}
+
+/// Take this generation's share of a queue: len / ticks_left, rounded up.
+fn drain_share(queue: &mut Vec<usize>, ticks_left: &mut u32) -> Vec<usize> {
+    let n = queue.len().div_ceil((*ticks_left).max(1) as usize);
+    *ticks_left = ticks_left.saturating_sub(1);
+    queue.split_off(queue.len() - n)
 }
 
 fn secs_between<R: Rng>(rng: &mut R, lo: u64, hi: u64) -> Duration {
@@ -143,6 +163,10 @@ impl Sim {
             hist_pos: 0,
             stagnant_since: None,
             calm_since: None,
+            spawn: Vec::new(),
+            spawn_ticks: 0,
+            erase: Vec::new(),
+            erase_ticks: 0,
         };
         s.reschedule(now, cfg);
         s
@@ -153,6 +177,13 @@ impl Sim {
         self.next_glider = now + secs_between(&mut self.rng, cfg.glider_min_secs, cfg.glider_max_secs);
         self.next_special = now + secs_between(&mut self.rng, cfg.special_min_secs, cfg.special_max_secs);
         self.next_stamp = now + secs_between(&mut self.rng, cfg.stamp_min_secs, cfg.stamp_max_secs);
+    }
+
+    /// The wallpaper is visible again after a pause: restart every timer so
+    /// gliders, stamps and the calm check don't all fire at once.
+    pub fn resume(&mut self, now: Instant, cfg: &Config) {
+        self.reschedule(now, cfg);
+        self.reset_stagnation();
     }
 
     /// Config changed (SIGHUP): adopt rule/trail/timers.
@@ -178,6 +209,7 @@ impl Sim {
         let significant = oc.abs_diff(cols) * 10 > oc || or.abs_diff(rows) * 10 > or;
         self.life.resize(cols, rows);
         self.rain = None; // rebuilt lazily at the new size
+        self.clear_queues();
         if significant {
             self.reseed(cfg);
         } else {
@@ -199,6 +231,7 @@ impl Sim {
 
         self.life.step();
         self.gen += 1;
+        self.drip();
 
         match (cfg.rain, self.rain.is_some()) {
             (true, false) => self.rain = Some(Rain::new(self.life.cols(), self.life.rows())),
@@ -249,15 +282,15 @@ impl Sim {
             self.next_stamp = now + secs_between(&mut self.rng, cfg.stamp_min_secs, cfg.stamp_max_secs);
         }
 
-        // 6. Clutter / calm census. A full reset only happens when settled
-        //    shapes (still lifes, oscillators) fill too much of the grid;
-        //    a merely calm board gets new life added on top of what it has.
+        // 6. Clutter / calm census. When settled shapes (still lifes,
+        //    oscillators) fill too much of the grid, some of them are pruned
+        //    away; a merely calm board gets new life added on top of what it
+        //    has. Neither wipes the board.
         if self.gen % CENSUS_EVERY == 0 {
             let total = (self.life.cols() * self.life.rows()) as f64;
             let (live, settled) = self.life.census();
-            if cfg.clutter_pct > 0.0 && settled as f64 * 100.0 >= total * cfg.clutter_pct {
-                self.reseed(cfg);
-                return;
+            if self.erase.is_empty() && cfg.clutter_pct > 0.0 && settled as f64 * 100.0 >= total * cfg.clutter_pct {
+                self.prune();
             }
             let active = (live - settled) as f64;
             if cfg.calm_pct > 0.0 && active * 100.0 < total * cfg.calm_pct {
@@ -290,8 +323,9 @@ impl Sim {
         self.hist_len = (self.hist_len + 1).min(HISTORY);
     }
 
-    /// Add new life without clearing anything: a few soup patches dropped
-    /// into the emptiest parts of the board, plus gliders where they work.
+    /// Add new life without clearing anything: a few soup patches in the
+    /// emptiest parts of the board (their cells appear over the next few
+    /// generations), plus gliders where they work.
     fn inject_fresh(&mut self) {
         let (cols, rows) = (self.life.cols(), self.life.rows());
         let rule = self.life.rule();
@@ -300,14 +334,76 @@ impl Sim {
         let density = (0.35 * rule.seed_scale()).min(0.9);
         for _ in 0..self.rng.gen_range(2..=4) {
             let (x, y) = self.life.emptiest_spot(&mut self.rng, pw, ph, 24);
-            self.life.soup_patch(&mut self.rng, x, y, pw, ph, density);
+            let cells = self.life.soup_cells(&mut self.rng, x, y, pw, ph, density);
+            self.spawn.extend(cells);
         }
+        self.spawn.shuffle(&mut self.rng);
+        self.spawn_ticks = DRIP_TICKS;
         if rule.supports_ships() {
             for _ in 0..self.rng.gen_range(1..=2) {
                 self.life.place_ship_on_edge(&mut self.rng, true, false);
             }
         }
         self.reset_stagnation();
+    }
+
+    /// Birth / erase this generation's share of the queued cells.
+    fn drip(&mut self) {
+        if !self.spawn.is_empty() {
+            for i in drain_share(&mut self.spawn, &mut self.spawn_ticks) {
+                self.life.set_alive(i);
+            }
+        }
+        if !self.erase.is_empty() {
+            for i in drain_share(&mut self.erase, &mut self.erase_ticks) {
+                self.life.kill(i);
+            }
+        }
+    }
+
+    /// Queue whole settled shapes for removal (about `PRUNE_FRACTION` of all
+    /// settled cells), erased over the next few generations.
+    fn prune(&mut self) {
+        let mut clusters = self.life.settled_clusters();
+        clusters.shuffle(&mut self.rng);
+        let total: usize = clusters.iter().map(Vec::len).sum();
+        let goal = ((total as f64 * PRUNE_FRACTION).ceil() as usize).max(1);
+        let mut cells = Vec::new();
+        for c in clusters {
+            if cells.len() >= goal {
+                break;
+            }
+            cells.extend(c);
+        }
+        self.erase = cells;
+        self.erase_ticks = DRIP_TICKS;
+    }
+
+    fn clear_queues(&mut self) {
+        self.spawn.clear();
+        self.erase.clear();
+    }
+
+    /// Adopt a saved board. False (nothing changed) if the board is empty or
+    /// was saved under a rule the config doesn't allow.
+    pub fn restore(&mut self, saved: &Saved, cfg: &Config) -> bool {
+        let Some(rule) = crate::life::Rule::parse(&saved.rule) else { return false };
+        if saved.cells.iter().all(|&c| c == 0) {
+            return false;
+        }
+        match cfg.rule {
+            RuleSel::Fixed(r) if r != rule => return false,
+            RuleSel::Rotate => match ROTATION.iter().position(|&r| r == rule) {
+                Some(i) => self.rule_idx = i,
+                None => return false,
+            },
+            _ => {}
+        }
+        self.life.set_rule(rule);
+        self.life.load(saved);
+        self.clear_queues();
+        self.reset_stagnation();
+        true
     }
 
     fn inject_special(&mut self) {
@@ -355,6 +451,7 @@ impl Sim {
         self.life.set_rule(rule);
         self.life.seed(&mut self.rng, (cfg.reseed_density * rule.seed_scale()).min(0.9));
         self.gen = 0;
+        self.clear_queues();
         self.reset_stagnation();
     }
 
@@ -400,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn calm_board_keeps_its_cells_when_new_life_arrives() {
+    fn calm_board_gets_new_life_dripped_in_without_a_reset() {
         let cfg = quiet_cfg();
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
@@ -408,19 +505,22 @@ mod tests {
         s.life.place(&Pattern::from_art(&["##", "##"]), 5, 5, 0);
         let mut now = t0;
         let mut ticks = 0u64;
+        let mut seen = Vec::new();
         loop {
             now += Duration::from_millis(250);
             s.tick(now, &cfg, 0.0);
             ticks += 1;
+            if ticks > 240 {
+                seen.push(s.life.population());
+            }
             if s.life.population() > 20 || ticks > 400 {
                 break;
             }
         }
         assert!(s.life.population() > 20, "never injected");
         assert_eq!(s.gen, ticks, "board was reset instead of added to");
-        for (x, y) in [(5, 5), (6, 5), (5, 6), (6, 6)] {
-            assert_eq!(s.life.cells()[y * 40 + x], 1);
-        }
+        // the patch arrives over several generations, not in one pop
+        assert!(seen.len() >= 2 && seen[0] < 20, "population jumped: {seen:?}");
     }
 
     #[test]
@@ -436,33 +536,53 @@ mod tests {
         assert_eq!(s.gen, 3600 * 4, "gen counter only resets on a full reseed");
     }
 
-    #[test]
-    fn clutter_of_settled_shapes_triggers_full_reset() {
-        let cfg = Config { clutter_pct: 5.0, ..quiet_cfg() };
-        let t0 = Instant::now();
-        let mut s = Sim::new(40, 30, t0, &cfg);
-        s.life.clear();
+    fn block_lattice(s: &mut Sim) {
         let block = Pattern::from_art(&["##", "##"]);
         for y in (0..30).step_by(5) {
             for x in (0..40).step_by(5) {
                 s.life.place(&block, x, y, 0);
             }
         }
-        let mut now = t0;
-        let mut reset = false;
-        for _ in 0..150 {
-            now += Duration::from_millis(250);
-            s.tick(now, &cfg, 0.0);
-            if s.gen == 0 {
-                reset = true;
-                break;
-            }
-        }
-        assert!(reset, "clogged board was never reset");
     }
 
     #[test]
-    fn sparse_settled_shapes_do_not_reset() {
+    fn clutter_prunes_settled_shapes_without_resetting() {
+        let cfg = Config { clutter_pct: 5.0, ..quiet_cfg() };
+        let t0 = Instant::now();
+        let mut s = Sim::new(40, 30, t0, &cfg);
+        s.life.clear();
+        block_lattice(&mut s); // 48 blocks = 16% of the grid
+        let mut now = t0;
+        for _ in 0..200 {
+            now += Duration::from_millis(250);
+            s.tick(now, &cfg, 0.0);
+        }
+        assert_eq!(s.gen, 200, "board was reset");
+        let (_, settled) = s.life.census();
+        assert!(settled > 0, "everything was wiped");
+        assert!((settled as f64) * 100.0 / 1200.0 < 5.0, "still cluttered: {settled}");
+        assert_eq!(settled % 4, 0, "shapes should be removed whole");
+    }
+
+    #[test]
+    fn pruned_cells_leave_death_trails() {
+        let cfg = Config { clutter_pct: 5.0, trail: true, trail_length: 4, ..quiet_cfg() };
+        let t0 = Instant::now();
+        let mut s = Sim::new(40, 30, t0, &cfg);
+        s.life.clear();
+        block_lattice(&mut s);
+        let mut now = t0;
+        let mut trailing = false;
+        for _ in 0..120 {
+            now += Duration::from_millis(250);
+            s.tick(now, &cfg, 0.0);
+            trailing |= s.life.trail().iter().any(|&t| t > 0);
+        }
+        assert!(trailing);
+    }
+
+    #[test]
+    fn sparse_settled_shapes_are_left_alone() {
         let cfg = Config { clutter_pct: 5.0, calm_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
@@ -477,6 +597,27 @@ mod tests {
             s.tick(now, &cfg, 0.0);
         }
         assert_eq!(s.gen, 300);
+        assert_eq!(s.life.population(), 12);
+    }
+
+    #[test]
+    fn restore_brings_back_a_saved_board_if_the_rule_matches() {
+        let cfg = Config::default();
+        let mut a = Sim::new(30, 20, Instant::now(), &cfg);
+        a.life.clear();
+        a.life.place(&Pattern::from_art(&["###"]), 4, 4, 0);
+        let saved = Saved { cols: 30, rows: 20, rule: a.life.rule().name(), cells: a.life.cells().to_vec(), age: a.life.age().to_vec() };
+
+        let mut b = Sim::new(30, 20, Instant::now(), &cfg);
+        assert!(b.restore(&saved, &cfg));
+        assert_eq!(b.life.cells(), a.life.cells());
+
+        let other = Config { rule: RuleSel::Fixed(crate::life::SEEDS), ..Config::default() };
+        let mut c = Sim::new(30, 20, Instant::now(), &other);
+        assert!(!c.restore(&saved, &other)); // saved under life, config wants seeds
+
+        let empty = Saved { cells: vec![0; 600], ..saved };
+        assert!(!b.restore(&empty, &cfg));
     }
 
     #[test]

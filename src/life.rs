@@ -341,19 +341,81 @@ impl Life {
         best
     }
 
-    /// Scatter random live cells over a rectangle without touching what is
-    /// already alive. Out-of-range parts of the rectangle are ignored.
-    pub fn soup_patch<R: Rng>(&mut self, rng: &mut R, x: usize, y: usize, w: usize, h: usize, density: f64) {
+    /// Indices of currently empty cells in a rectangle, each picked with
+    /// probability `density`. Used to drip a soup patch in over a few ticks.
+    pub fn soup_cells<R: Rng>(&self, rng: &mut R, x: usize, y: usize, w: usize, h: usize, density: f64) -> Vec<usize> {
         let d = density.clamp(0.0, 1.0);
+        let mut out = Vec::new();
         for yy in y..(y + h).min(self.rows) {
             for xx in x..(x + w).min(self.cols) {
                 let i = yy * self.cols + xx;
                 if self.cur[i] == 0 && rng.gen_bool(d) {
-                    self.cur[i] = 1;
-                    self.age[i] = 0;
-                    self.trail[i] = 0;
+                    out.push(i);
                 }
             }
+        }
+        out
+    }
+
+    /// Make one cell alive (newborn).
+    pub fn set_alive(&mut self, i: usize) {
+        if i < self.cur.len() {
+            self.cur[i] = 1;
+            self.age[i] = 0;
+            self.trail[i] = 0;
+        }
+    }
+
+    /// Kill one occupied cell, leaving a full-length death trail.
+    pub fn kill(&mut self, i: usize) {
+        if i < self.cur.len() && self.cur[i] != 0 {
+            self.cur[i] = 0;
+            self.age[i] = 0;
+            self.trail[i] = self.trail_len;
+        }
+    }
+
+    /// Groups of touching settled cells (8-neighbourhood, edges wrap), i.e.
+    /// whole still lifes / oscillators, as lists of cell indices.
+    pub fn settled_clusters(&self) -> Vec<Vec<usize>> {
+        let (cols, rows) = (self.cols, self.rows);
+        let settled = |i: usize| self.cur[i] != 0 && is_periodic(self.hist[i]);
+        let mut seen = vec![false; cols * rows];
+        let mut out = Vec::new();
+        for start in 0..cols * rows {
+            if seen[start] || !settled(start) {
+                continue;
+            }
+            seen[start] = true;
+            let mut stack = vec![start];
+            let mut cluster = Vec::new();
+            while let Some(i) = stack.pop() {
+                cluster.push(i);
+                let (x, y) = (i % cols, i / cols);
+                for dy in [rows - 1, 0, 1] {
+                    for dx in [cols - 1, 0, 1] {
+                        let j = ((y + dy) % rows) * cols + (x + dx) % cols;
+                        if !seen[j] && settled(j) {
+                            seen[j] = true;
+                            stack.push(j);
+                        }
+                    }
+                }
+            }
+            out.push(cluster);
+        }
+        out
+    }
+
+    /// Replace the board with a saved one (overlapping part only if the
+    /// sizes differ). Rule handling is the caller's job.
+    pub fn load(&mut self, saved: &crate::state::Saved) {
+        self.clear();
+        let cc = self.cols.min(saved.cols);
+        for y in 0..self.rows.min(saved.rows) {
+            let (d, s) = (y * self.cols, y * saved.cols);
+            self.cur[d..d + cc].copy_from_slice(&saved.cells[s..s + cc]);
+            self.age[d..d + cc].copy_from_slice(&saved.age[s..s + cc]);
         }
     }
 
@@ -558,19 +620,53 @@ mod tests {
     }
 
     #[test]
-    fn soup_patch_keeps_existing_cells_and_emptiest_spot_avoids_them() {
+    fn soup_cells_only_pick_empty_cells_and_emptiest_spot_avoids_life() {
         let mut rng = rand::thread_rng();
         let mut l = Life::new(40, 20, 0, CONWAY);
-        l.soup_patch(&mut rng, 0, 0, 20, 20, 1.0);
+        let first = l.soup_cells(&mut rng, 0, 0, 20, 20, 1.0);
+        assert_eq!(first.len(), 400);
+        for i in first {
+            l.set_alive(i);
+        }
         assert_eq!(l.population(), 400);
-        l.soup_patch(&mut rng, 0, 0, 40, 20, 1.0);
-        assert_eq!(l.population(), 800);
-        let mut l = Life::new(40, 20, 0, CONWAY);
-        l.soup_patch(&mut rng, 0, 0, 20, 20, 1.0);
+        assert_eq!(l.soup_cells(&mut rng, 0, 0, 40, 20, 1.0).len(), 400); // only the empty half
         for _ in 0..20 {
             let (x, y) = l.emptiest_spot(&mut rng, 10, 10, 64);
             assert_eq!(l.count_in(x, y, 10, 10), 0);
         }
+    }
+
+    #[test]
+    fn kill_leaves_a_trail() {
+        let mut l = Life::new(6, 6, 5, CONWAY);
+        l.set_alive(8);
+        l.kill(8);
+        assert_eq!((l.cells()[8], l.trail()[8]), (0, 5));
+    }
+
+    #[test]
+    fn settled_clusters_are_whole_shapes() {
+        let mut l = Life::new(40, 40, 0, CONWAY);
+        l.place(&Pattern::from_art(&["##", "##"]), 2, 2, 0);
+        l.place(&Pattern::from_art(&["##", "##"]), 20, 20, 0);
+        l.place(&Pattern::from_art(&["###"]), 10, 30, 0);
+        l.place(&patterns::glider(), 30, 5, 0);
+        for _ in 0..70 {
+            l.step();
+        }
+        let mut sizes: Vec<usize> = l.settled_clusters().iter().map(Vec::len).collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![3, 4, 4]); // glider excluded
+    }
+
+    #[test]
+    fn load_copies_overlap() {
+        let saved = crate::state::Saved { cols: 4, rows: 4, rule: "life".into(), cells: (0..16).map(|i| (i == 5) as u8).collect(), age: vec![7; 16] };
+        let mut l = Life::new(8, 2, 0, CONWAY);
+        l.load(&saved);
+        assert_eq!(l.cells()[8 + 1], 1);
+        assert_eq!(l.population(), 1);
+        assert_eq!(l.age()[8 + 1], 7);
     }
 
     #[test]

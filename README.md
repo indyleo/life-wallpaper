@@ -65,9 +65,16 @@ The manual page is in `man/life-wallpaper.1`. View it with `man ./man/life-wallp
 
 ## Staleness and resets
 
-The board is never wiped on a timer. When it goes calm (`stagnation_secs`, default 60, with moving or chaotic cells below `calm_pct` of the grid, or the whole board repeating), new life is added on top of what is already there: soup patches in the emptiest areas plus gliders. A full reset only happens when still lifes and oscillators cover `clutter_pct` of the grid (default 8, `0` = never). `soft_reset_secs` still exists as an optional timed reset and defaults to `0` (off).
+The board is never wiped on a timer. When it goes calm (`stagnation_secs`, default 60, with moving or chaotic cells below `calm_pct` of the grid, or the whole board repeating), new life is added on top of what is already there: soup patches in the emptiest areas plus gliders. When still lifes and oscillators pile up and cover `clutter_pct` of the grid (default 8, `0` = never), about half of them are pruned, whole shapes at a time, fading out over a few generations. The board is never wiped. New soup patches are also dripped in over a few generations instead of appearing at once. `soft_reset_secs` still exists as an optional timed full reset and defaults to `0` (off).
 
 If your existing `~/.config/life-wallpaper/config.toml` was created from an older template, it still contains `soft_reset_secs = 300`. Set it to `0` (or delete the line) to stop the timed resets.
+
+## Smoothness, look and persistence
+
+- **Crossfade (`smooth`, `render_fps`):** the simulation still steps at `fps`, but cells fade between generations at up to `render_fps` frames per second, so births fade in and deaths fade out. Only the cells that change are redrawn, and an idle board draws nothing. `smooth = false` gives the old stepped look.
+- **Pause when hidden (`pause_hidden`):** the wallpaper keeps a Wayland frame callback in flight. If the compositor stops answering it (a fullscreen window on top, screen off or locked), simulating and drawing stop until it answers again, then the timers restart. This only kicks in once the compositor has answered a callback before.
+- **Cell look (`cell_gap`, `cell_round`):** a gap of 1 px between cells and rounded corners by default. Set `cell_gap = 0` and `cell_round = false` for solid blocks. The gap scales with the output scale.
+- **Persistence (`persist`, `save_secs`):** the board of each output is saved to `$XDG_STATE_HOME/life-wallpaper/<output>.board` (default `~/.local/state/life-wallpaper/`) on exit and every `save_secs`, and restored on start. It is skipped if the file is missing or invalid, if the board was empty, or if it was saved under a different rule than the one the config fixes. A changed resolution keeps the overlapping part.
 
 ## Configuration hot reload
 

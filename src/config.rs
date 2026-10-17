@@ -34,6 +34,10 @@ pub struct Palette {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub cell_size: usize,
+    /// Pixels (logical) left empty between neighbouring cells.
+    pub cell_gap: usize,
+    /// Round the corners of each cell.
+    pub cell_round: bool,
     pub fps: f64,
     pub density: f64,
     pub reseed_density: f64,
@@ -57,6 +61,15 @@ pub struct Config {
     /// Board counts as calm while moving/chaotic cells are below this
     /// percent of the grid. 0 = only a fully repeating board is calm.
     pub calm_pct: f64,
+    /// Crossfade cells between generations (renders at `render_fps`).
+    pub smooth: bool,
+    pub render_fps: f64,
+    /// Save the board on exit (and every `save_secs`) and restore it at start.
+    pub persist: bool,
+    /// Stop simulating and drawing while the compositor isn't showing the
+    /// wallpaper (fullscreen window on top, screen off).
+    pub pause_hidden: bool,
+    pub save_secs: u64,
     pub glider_min_secs: u64,
     pub glider_max_secs: u64,
     pub special_min_secs: u64,
@@ -71,6 +84,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             cell_size: 8,
+            cell_gap: 1,
+            cell_round: true,
             fps: 4.0,
             density: 0.25,
             reseed_density: 0.30,
@@ -88,6 +103,11 @@ impl Default for Config {
             stagnation_secs: 60,
             clutter_pct: 8.0,
             calm_pct: 0.3,
+            smooth: true,
+            render_fps: 30.0,
+            persist: true,
+            pause_hidden: true,
+            save_secs: 300,
             glider_min_secs: 60,
             glider_max_secs: 90,
             special_min_secs: 90,
@@ -109,7 +129,7 @@ impl Default for Config {
     }
 }
 
-pub const BOOL_KEYS: &[&str] = &["trail", "rain", "overlay", "sysload", "patterns", "stamps"];
+pub const BOOL_KEYS: &[&str] = &["trail", "rain", "overlay", "sysload", "patterns", "stamps", "smooth", "persist", "pause_hidden", "cell_round"];
 
 pub fn parse_color(s: &str) -> Result<Rgb, String> {
     let named = match s.to_ascii_lowercase().as_str() {
@@ -156,6 +176,9 @@ impl Config {
         let key = key.replace('-', "_");
         match key.as_str() {
             "cell_size" => self.cell_size = num(val, 2, 64)?,
+            "cell_gap" => self.cell_gap = num(val, 0, 8)?,
+            "cell_round" => self.cell_round = parse_bool(val)?,
+            "pause_hidden" => self.pause_hidden = parse_bool(val)?,
             "fps" | "tick_hz" => self.fps = num(val, 0.1, 60.0)?,
             "density" => {
                 let d = num(val, 0.0, 1.0)?;
@@ -186,6 +209,10 @@ impl Config {
             "soft_reset_secs" => self.soft_reset_secs = num(val, 0, 86_400)?,
             "clutter_pct" => self.clutter_pct = num(val, 0.0, 100.0)?,
             "calm_pct" => self.calm_pct = num(val, 0.0, 100.0)?,
+            "smooth" => self.smooth = parse_bool(val)?,
+            "render_fps" => self.render_fps = num(val, 1.0, 60.0)?,
+            "persist" => self.persist = parse_bool(val)?,
+            "save_secs" => self.save_secs = num(val, 0, 86_400)?,
             "stagnation_secs" => self.stagnation_secs = num(val, 1, 86_400)?,
             "glider_min_secs" => self.glider_min_secs = num(val, 1, 86_400)?,
             "glider_max_secs" => self.glider_max_secs = num(val, 1, 86_400)?,
@@ -342,6 +369,12 @@ usage: life-wallpaper [options]
       --[no-]sysload      let CPU load drive speed, sparks and heat
       --[no-]patterns     periodic LWSS / pulsar / Gosper gun injections
       --[no-]stamps       periodic Tux / Arch / text stamps
+      --[no-]smooth       crossfade cells between generations (default on)
+      --render-fps HZ     frames per second while crossfading (default 30)
+      --[no-]persist      save the board on exit and restore it on start (default on)
+      --[no-]pause-hidden stop simulating/drawing while the wallpaper is covered (default on)
+      --cell-gap PX       empty pixels between cells (0-8, default 1)
+      --[no-]cell-round   round cell corners (default on)
   -h, --help
 
 SIGHUP reloads the config file. Any option can also be set in the config as key = value

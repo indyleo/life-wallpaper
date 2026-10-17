@@ -8,6 +8,7 @@ mod font;
 mod life;
 mod patterns;
 mod render;
+mod state;
 mod sysload;
 mod wayland;
 
@@ -74,18 +75,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // --- Single event loop: Wayland fd + generation timer + signals --------
+    // --- Single event loop: Wayland fd + frame timer (generations are stepped from it) + signals --------
     let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
     let handle = event_loop.handle();
 
     WaylandSource::new(conn.clone(), event_queue).insert(handle.clone()).expect("failed to register Wayland source");
 
     handle
-        .insert_source(Timer::from_duration(app.interval()), |deadline, _, app: &mut App| {
+        .insert_source(Timer::from_duration(app.frame_interval()), |deadline, _, app: &mut App| {
             let now = Instant::now();
             app.on_tick(now);
             // Schedule from the previous deadline to avoid drift; never from the past.
-            let iv = app.interval();
+            let iv = app.frame_interval();
             let next = deadline + iv;
             TimeoutAction::ToInstant(if next > now { next } else { now + iv })
         })

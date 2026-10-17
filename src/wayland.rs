@@ -39,13 +39,23 @@ use smithay_client_toolkit::{
 
 use crate::config::{Config, ConfigSource};
 use crate::controller::Sim;
-use crate::render::{self, Renderer, Target, SENTINEL};
+use crate::render::{self, Fade, Key, Renderer, Target, SENTINEL};
+use crate::state;
 use crate::sysload::CpuLoad;
+
+/// A frame callback not answered for this long means the compositor isn't
+/// showing the wallpaper (fullscreen window on top, screen off, ...).
+const HIDDEN_AFTER: Duration = Duration::from_millis(750);
+/// While nothing is being committed, keep a callback in flight at this pace
+/// so a covered wallpaper is still noticed.
+const PROBE_EVERY: Duration = Duration::from_secs(1);
+/// Timer pace while every wall is hidden: just enough to notice un-hiding.
+const HIDDEN_POLL: Duration = Duration::from_millis(200);
 
 struct Buf {
     buffer: Buffer,
     /// What this buffer's pixels currently show (display keys).
-    shown: Vec<u16>,
+    shown: Vec<Key>,
 }
 
 /// One output's wallpaper surface plus its own simulation.
@@ -58,15 +68,24 @@ struct Wall {
     logical: (u32, u32),
     px: (usize, usize), // buffer size in device pixels
     cell: usize,        // cell size in device pixels
+    gap: usize,         // gap between cells in device pixels
     cols: usize,
     rows: usize,
     pool: Option<SlotPool>,
     bufs: Vec<Buf>, // exactly two once configured
     next_buf: usize,
     sim: Option<Sim>,
-    display: Vec<u16>,
-    presented: Vec<u16>, // what the compositor currently shows
+    state_path: Option<PathBuf>,
+    fade: Fade,
+    display: Vec<Key>,   // what we want on screen right now (mid-fade colours)
+    presented: Vec<Key>, // what the compositor currently shows
     damage: Vec<[i32; 4]>,
+    // frame-callback bookkeeping for pause-when-hidden
+    frame_pending: bool,
+    frame_sent: Instant,
+    frame_seen: bool,
+    hidden: bool,
+    resume: bool,
 }
 
 impl Drop for Wall {
@@ -83,7 +102,7 @@ impl Drop for Wall {
 
 impl Wall {
     /// (Re)create buffers and grid for the current logical size and scale.
-    fn rebuild(&mut self, cfg: &Config, shm: &Shm, now: Instant) {
+    fn rebuild(&mut self, cfg: &Config, shm: &Shm, now: Instant, output_name: Option<&str>) {
         let (lw, lh) = self.logical;
         if lw == 0 || lh == 0 {
             return;
@@ -92,11 +111,21 @@ impl Wall {
         let pw = ((lw as u64 * s + 60) / 120).max(1) as usize;
         let ph = ((lh as u64 * s + 60) / 120).max(1) as usize;
         let cell = ((cfg.cell_size as u64 * s + 60) / 120).max(1) as usize;
+        let gap = ((cfg.cell_gap as u64 * s + 60) / 120) as usize;
         let (cols, rows) = render::grid_dims(pw, ph, cell);
 
         match self.sim.as_mut() {
             Some(sim) => sim.resize(cols, rows, cfg),
-            None => self.sim = Some(Sim::new(cols, rows, now, cfg)),
+            None => {
+                let mut sim = Sim::new(cols, rows, now, cfg);
+                self.state_path = state::path_for(output_name);
+                if cfg.persist {
+                    if let Some(saved) = self.state_path.as_deref().and_then(state::load) {
+                        sim.restore(&saved, cfg);
+                    }
+                }
+                self.sim = Some(sim);
+            }
         }
 
         let surface = self.layer.wl_surface();
@@ -117,23 +146,78 @@ impl Wall {
         }
         self.pool = Some(pool);
         self.display = vec![0; cols * rows];
+        self.fade = Fade::new(cols * rows, now);
         self.presented = vec![SENTINEL; cols * rows];
         self.px = (pw, ph);
         self.cell = cell;
+        self.gap = gap;
+        self.hidden = false;
+        self.resume = false;
+        self.frame_pending = false;
         self.cols = cols;
         self.rows = rows;
         self.next_buf = 0;
     }
 
-    /// Compose the frame; if anything differs from what the compositor shows,
-    /// repaint only the changed cells into a free buffer and commit with
-    /// per-row damage. Does nothing (no commit) when nothing changed.
-    fn present(&mut self, r: &Renderer, cfg: &Config, hz: f64) {
+    /// Show the current generation immediately (no fade) and commit it.
+    fn present(&mut self, r: &Renderer, cfg: &Config, hz: f64, qh: &QueueHandle<App>) {
         let Some(sim) = self.sim.as_ref() else { return };
         if self.bufs.len() != 2 {
             return;
         }
-        r.compose(sim, cfg, hz, &mut self.display);
+        r.compose(sim, cfg, hz, self.fade.target_mut());
+        self.fade.snap(&mut self.display);
+        self.flush(r, qh);
+    }
+
+    /// A new generation was just simulated: start fading towards it.
+    fn next_generation(&mut self, r: &Renderer, cfg: &Config, hz: f64, now: Instant, interval: Duration) {
+        let Some(sim) = self.sim.as_ref() else { return };
+        if self.bufs.len() != 2 {
+            return;
+        }
+        r.compose(sim, cfg, hz, self.fade.target_mut());
+        self.fade.begin(&mut self.display, now, render::fade_duration(interval), cfg.smooth);
+    }
+
+    /// One animation frame: advance the crossfade, then commit if needed.
+    fn frame(&mut self, r: &Renderer, cfg: &Config, qh: &QueueHandle<App>, now: Instant) {
+        if self.bufs.len() != 2 {
+            return;
+        }
+        self.fade.step(now, &mut self.display);
+        self.flush(r, qh);
+        // Nothing to commit for a while? Send an empty commit with a frame
+        // request so we can still tell when the wallpaper gets covered.
+        if cfg.pause_hidden && !self.frame_pending && now.saturating_duration_since(self.frame_sent) >= PROBE_EVERY {
+            self.request_frame(qh, now);
+            self.layer.commit();
+        }
+    }
+
+    /// Ask for a frame callback with the next commit.
+    fn request_frame(&mut self, qh: &QueueHandle<App>, now: Instant) {
+        let surface = self.layer.wl_surface();
+        surface.frame(qh, surface.clone());
+        self.frame_pending = true;
+        self.frame_sent = now;
+    }
+
+    /// Covered = a frame callback we asked for hasn't come back in time. Only
+    /// trusted once this compositor has answered one before, so a compositor
+    /// that never sends them can't pause us forever.
+    fn update_hidden(&mut self, now: Instant, cfg: &Config) {
+        if !cfg.pause_hidden {
+            self.hidden = false;
+        } else if self.frame_seen && self.frame_pending && now.saturating_duration_since(self.frame_sent) > HIDDEN_AFTER {
+            self.hidden = true;
+        }
+    }
+
+    /// If anything differs from what the compositor shows, repaint only the
+    /// changed cells into a free buffer and commit with per-row damage. Does
+    /// nothing (no commit) when nothing changed.
+    fn flush(&mut self, r: &Renderer, qh: &QueueHandle<App>) {
         if self.display == self.presented {
             return;
         }
@@ -145,7 +229,7 @@ impl Wall {
             let Some(canvas) = buffer.canvas(pool) else {
                 continue; // still held by the compositor
             };
-            let mut t = Target { canvas, w: self.px.0, h: self.px.1, cell: self.cell, cols: self.cols, rows: self.rows };
+            let mut t = Target { canvas, w: self.px.0, h: self.px.1, cell: self.cell, gap: self.gap, cols: self.cols, rows: self.rows };
             r.draw(&mut t, &self.display, shown, &mut self.presented, &mut self.damage);
 
             let surface = self.layer.wl_surface();
@@ -156,17 +240,21 @@ impl Wall {
             for d in &self.damage {
                 surface.damage_buffer(d[0], d[1], d[2], d[3]);
             }
+            if !self.frame_pending {
+                self.request_frame(qh, Instant::now());
+            }
             self.layer.commit();
             self.next_buf = (idx + 1) % 2;
             return;
         }
-        // Both buffers busy: nothing recorded as presented, so the next tick retries.
+        // Both buffers busy: nothing recorded as presented, so the next frame retries.
     }
 }
 
 pub struct App {
     registry_state: RegistryState,
     pub output_state: OutputState,
+    qh: QueueHandle<Self>,
     shm: Shm,
     compositor: CompositorState,
     layer_shell: LayerShell,
@@ -181,6 +269,9 @@ pub struct App {
     renderer: Renderer,
     load: CpuLoad,
     next_sample: Instant,
+    next_gen: Instant,
+    next_save: Instant,
+    next_config_check: Instant,
     spawn: bool,
     pub exit: bool,
 }
@@ -198,6 +289,7 @@ impl App {
     ) -> Self {
         let frac_mgr = globals.bind::<WpFractionalScaleManagerV1, _, _>(qh, 1..=1, GlobalData).ok();
         let viewporter = globals.bind::<WpViewporter, _, _>(qh, 1..=1, GlobalData).ok();
+        let (cfg_fps, cfg_save) = (cfg.fps, cfg.save_secs.max(1));
         let config_path = src.path.clone().or_else(ConfigSource::default_path);
         let config_modified = config_path.as_ref()
             .and_then(|p| std::fs::metadata(p).ok())
@@ -205,6 +297,7 @@ impl App {
         Self {
             registry_state: RegistryState::new(globals),
             output_state: OutputState::new(globals, qh),
+            qh: qh.clone(),
             shm,
             compositor,
             layer_shell,
@@ -218,6 +311,9 @@ impl App {
             config_modified,
             load: CpuLoad::new(),
             next_sample: Instant::now(),
+            next_gen: Instant::now() + Duration::from_secs_f64(1.0 / cfg_fps),
+            next_save: Instant::now() + Duration::from_secs(cfg_save),
+            next_config_check: Instant::now(),
             spawn,
             exit: false,
         }
@@ -242,21 +338,78 @@ impl App {
         1.0 / self.interval().as_secs_f64()
     }
 
-    /// Called from the single calloop timer.
+    /// How often the timer fires: every animation frame while crossfading,
+    /// otherwise once per generation.
+    pub fn frame_interval(&self) -> Duration {
+        if !self.walls.is_empty() && self.walls.iter().all(|w| w.hidden) {
+            return HIDDEN_POLL;
+        }
+        let tick = self.interval();
+        if self.cfg.smooth {
+            tick.min(Duration::from_secs_f64(1.0 / self.cfg.render_fps))
+        } else {
+            tick
+        }
+    }
+
+    /// Called from the single calloop timer: steps the simulation when a
+    /// generation is due, then advances the crossfade and commits a frame.
     pub fn on_tick(&mut self, now: Instant) {
-        self.check_config_file();
-        if self.cfg.sysload && now >= self.next_sample {
-            self.load.sample();
-            self.next_sample = now + Duration::from_secs(1);
+        if now >= self.next_config_check {
+            self.next_config_check = now + Duration::from_millis(500);
+            self.check_config_file();
+        }
+        let gen_due = now >= self.next_gen;
+        if gen_due {
+            if self.cfg.sysload && now >= self.next_sample {
+                self.load.sample();
+                self.next_sample = now + Duration::from_secs(1);
+            }
+            // Schedule from the previous deadline to avoid drift; never from the past.
+            let iv = self.interval();
+            let next = self.next_gen + iv;
+            self.next_gen = if next > now { next } else { now + iv };
         }
         let load = if self.cfg.sysload { self.load.value() } else { 0.0 };
         let hz = self.hz();
-        let App { walls, cfg, renderer, .. } = self;
+        let interval = self.interval();
+        let App { walls, cfg, renderer, qh, .. } = &mut *self;
         for w in walls.iter_mut() {
-            if let Some(sim) = w.sim.as_mut() {
-                sim.tick(now, cfg, load);
+            w.update_hidden(now, cfg);
+            if w.hidden {
+                continue; // covered: no simulating, no drawing
             }
-            w.present(renderer, cfg, hz);
+            if w.resume {
+                // Visible again: restart the timers and jump to the current board.
+                w.resume = false;
+                if let Some(sim) = w.sim.as_mut() {
+                    sim.resume(now, cfg);
+                }
+                w.present(renderer, cfg, hz, qh);
+                continue;
+            }
+            if gen_due {
+                if let Some(sim) = w.sim.as_mut() {
+                    sim.tick(now, cfg, load);
+                }
+                w.next_generation(renderer, cfg, hz, now, interval);
+            }
+            w.frame(renderer, cfg, qh, now);
+        }
+        if self.cfg.persist && self.cfg.save_secs > 0 && now >= self.next_save {
+            self.next_save = now + Duration::from_secs(self.cfg.save_secs);
+            self.save_all();
+        }
+    }
+
+    /// Write every wall's board to its state file.
+    fn save_all(&self) {
+        for w in &self.walls {
+            if let (Some(sim), Some(path)) = (w.sim.as_ref(), w.state_path.as_ref()) {
+                if let Err(e) = state::save(path, &sim.life) {
+                    eprintln!("life-wallpaper: could not save {}: {e}", path.display());
+                }
+            }
         }
     }
 
@@ -283,13 +436,15 @@ impl App {
                 self.cfg = new;
                 self.renderer = Renderer::new(&self.cfg);
                 let (now, hz) = (Instant::now(), self.hz());
-                let App { walls, cfg, shm, renderer, .. } = self;
-                for w in walls.iter_mut() {
+                let names: Vec<Option<String>> =
+                    self.walls.iter().map(|w| self.output_state.info(&w.output).and_then(|i| i.name)).collect();
+                let App { walls, cfg, shm, renderer, qh, .. } = self;
+                for (w, name) in walls.iter_mut().zip(&names) {
                     if let Some(sim) = w.sim.as_mut() {
                         sim.reconfigure(now, cfg);
                     }
-                    w.rebuild(cfg, shm, now);
-                    w.present(renderer, cfg, hz);
+                    w.rebuild(cfg, shm, now, name.as_deref());
+                    w.present(renderer, cfg, hz, qh);
                 }
                 eprintln!("life-wallpaper: config reloaded");
             }
@@ -299,6 +454,9 @@ impl App {
 
     /// Drop every Wayland object we own.
     pub fn shutdown(&mut self) {
+        if self.cfg.persist {
+            self.save_all();
+        }
         self.walls.clear();
     }
 
@@ -308,10 +466,11 @@ impl App {
 
     fn refresh(&mut self, i: usize) {
         let hz = self.hz();
-        let App { walls, cfg, shm, renderer, .. } = self;
+        let name = self.output_state.info(&self.walls[i].output).and_then(|o| o.name);
+        let App { walls, cfg, shm, renderer, qh, .. } = self;
         let w = &mut walls[i];
-        w.rebuild(cfg, shm, Instant::now());
-        w.present(renderer, cfg, hz);
+        w.rebuild(cfg, shm, Instant::now(), name.as_deref());
+        w.present(renderer, cfg, hz, qh);
     }
 
     /// Create a wall for `output` if it passes the `--output` filter.
@@ -350,15 +509,23 @@ impl App {
             logical: (0, 0),
             px: (0, 0),
             cell: 8,
+            gap: 0,
             cols: 0,
             rows: 0,
             pool: None,
             bufs: Vec::new(),
             next_buf: 0,
             sim: None,
+            state_path: None,
+            fade: Fade::new(0, Instant::now()),
             display: Vec::new(),
             presented: Vec::new(),
             damage: Vec::new(),
+            frame_pending: false,
+            frame_sent: Instant::now(),
+            frame_seen: false,
+            hidden: false,
+            resume: false,
         });
     }
 }
@@ -388,8 +555,8 @@ impl LayerShellHandler for App {
         } else {
             wall.presented.fill(SENTINEL); // answer the configure with a full commit
             let hz = self.hz();
-            let App { walls, cfg, renderer, .. } = self;
-            walls[i].present(renderer, cfg, hz);
+            let App { walls, cfg, renderer, qh, .. } = self;
+            walls[i].present(renderer, cfg, hz, qh);
         }
     }
 }
@@ -406,7 +573,18 @@ impl CompositorHandler for App {
         }
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &WlSurface, _: u32) {
+        // The compositor drew (or can draw) our surface again.
+        if let Some(i) = self.wall_idx(surface) {
+            let w = &mut self.walls[i];
+            w.frame_pending = false;
+            w.frame_seen = true;
+            if w.hidden {
+                w.hidden = false;
+                w.resume = true;
+            }
+        }
+    }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: &wl_output::WlOutput) {}
 }
