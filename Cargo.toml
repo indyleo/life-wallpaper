@@ -1,6 +1,6 @@
 [package]
 name = "life-wallpaper"
-version = "1.0.2"
+version = "0.1.0"
 edition = "2021"
 description = "Conway's Game of Life as a native Wayland wallpaper (wlr-layer-shell, wl_shm)"
 

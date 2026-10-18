@@ -113,6 +113,7 @@ pkill -HUP life-wallpaper
 ## License
 
 MIT
+
 ## Example configurations
 
 The `config_example/` directory includes optional presets you can try:
@@ -124,3 +125,7 @@ The `config_example/` directory includes optional presets you can try:
 - `minimal.toml` — a clean look without trails, rain, overlays, patterns, or stamps.
 
 To try a preset, copy its settings into `~/.config/life-wallpaper/config.toml` (or the file you selected with `--config`). You can also copy the preset over that file, then edit it as desired. The running wallpaper automatically reloads changes when the file is saved.
+
+# Preview
+
+![Preview Image](./preview.png)
