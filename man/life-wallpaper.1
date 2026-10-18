@@ -165,6 +165,46 @@ Use a custom configuration file:
 .TP
 List available outputs:
 .B life-wallpaper --list-outputs
+.SH LIVELINESS AND LOOK OPTIONS
+These can be set in the config file as
+.IR key " = " value
+and most also as command-line flags (underscores become dashes).
+.TP
+.BR local_calm_secs ", " tile_size
+A tile of the board with nothing moving for this long gets new life. 0 turns it off.
+.TP
+.BR decay_after ", " decay_chance
+Cells stuck in a still life or oscillator for this many generations die with the given per-generation chance.
+.TP
+.B noise_per_sec
+Random single-cell disturbances per second.
+.TP
+.BR rule_shift_secs ", " rule_shift_gens
+Briefly swap to a livelier rule (B34/S23, B3/S234 or B3/S2345) on Life and HighLife boards.
+.TP
+.BR fastforward ", " fastforward_speed
+Run extra generations per tick while the whole board is calm.
+.TP
+.BR colonies ", " colony_mutation ", " colony_colors
+Births inherit the majority colour of their parents (requires color = age).
+.TP
+.BR traffic ", " traffic_min_secs ", " traffic_max_secs ", " gun_secs
+Spaceship convoys, and the lifetime of Gosper guns (0 = forever).
+.TP
+.B symmetry_chance
+Chance that an injected soup is symmetric.
+.TP
+.B hypr_events
+React to Hyprland workspace and window events.
+.TP
+.BR breathe ", " breathe_secs
+Slowly vary the generation rate by this fraction.
+.TP
+.BR glow ", " vignette
+Soft halo around live cells; dim towards the screen edges.
+.TP
+.BR hue_drift ", " hue_drift_secs ", " night_dim ", " night_start ", " night_end
+Slow palette hue drift and night-time dimming (local hours).
 .SH ENVIRONMENT
 .TP
 .B XDG_CONFIG_HOME

@@ -69,6 +69,30 @@ The board is never wiped on a timer. When it goes calm (`stagnation_secs`, defau
 
 If your existing `~/.config/life-wallpaper/config.toml` was created from an older template, it still contains `soft_reset_secs = 300`. Set it to `0` (or delete the line) to stop the timed resets.
 
+## Keeping the board lively
+
+Nothing here wipes the board. Everything either adds life, thins out frozen shapes, or changes the pace.
+
+- **Local calm (`local_calm_secs`, `tile_size`):** the board is cut into tiles. A tile with nothing moving in it for `local_calm_secs` gets a soup patch (sometimes symmetric), a glider aimed through it, or a methuselah (R-pentomino / acorn). One tile at a time, and not while more than 30% of the board is alive.
+- **Decay (`decay_after`, `decay_chance`):** cells that have been stuck in a still life or oscillator for `decay_after` generations (counted once the 64-generation history shows it) die with `decay_chance` per generation. Gliders and chaos are never touched.
+- **Cosmic rays (`noise_per_sec`):** random single-cell disturbances knock oscillators out of phase.
+- **Rule shifts (`rule_shift_secs`, `rule_shift_gens`):** every so often the rule becomes `B34/S23`, `B3/S234` or `B3/S2345` for a few generations, then returns. Only on Life / HighLife boards. The overlay shows the temporary rule. Longer shifts flood the board, so keep `rule_shift_gens` small.
+- **Fast-forward (`fastforward`, `fastforward_speed`):** while the whole board is calm it runs several generations per tick.
+- **Colonies (`colonies`, `colony_mutation`, `colony_colors`):** every cell has a colony; a newborn takes the majority colour of its parents, now and then mutating. Each injection brings a fresh colour. Needs `color = "age"`; shading by age still applies.
+- **Traffic and guns (`traffic`, `gun_secs`):** convoys of two to four LWSS / MWSS / HWSS enter from one edge; Gosper guns are removed after `gun_secs`.
+- **Symmetry (`symmetry_chance`):** injected soups are sometimes mirrored or rotated.
+- **Hyprland (`hypr_events`):** listens on Hyprland's event socket. A workspace switch sends gliders across, a new window sparks a patch of life and a closed window leaves a symmetric bloom (at a random empty spot, not where the window was). Does nothing outside Hyprland.
+
+## Extra look options
+
+- **`breathe`, `breathe_secs`:** the generation rate swells and ebbs by up to +-`breathe` over `breathe_secs`.
+- **`glow`:** empty cells next to live ones take a little of their colour (a cell-resolution blur), so halos fade in and out with the cells.
+- **`vignette`:** dims cells towards the screen edges.
+- **`hue_drift`, `hue_drift_secs`:** the palette hue wanders by up to +-`hue_drift` degrees.
+- **`night_dim`, `night_start`, `night_end`:** removes up to `night_dim` of the brightness between those local hours, with a 45 minute ramp at each end.
+
+Saved boards now also store colony colours; older save files still load.
+
 ## Smoothness, look and persistence
 
 - **Crossfade (`smooth`, `render_fps`):** the simulation still steps at `fps`, but cells fade between generations at up to `render_fps` frames per second, so births fade in and deaths fade out. Only the cells that change are redrawn, and an idle board draws nothing. `smooth = false` gives the old stepped look.
@@ -89,7 +113,6 @@ pkill -HUP life-wallpaper
 ## License
 
 MIT
-
 ## Example configurations
 
 The `config_example/` directory includes optional presets you can try:

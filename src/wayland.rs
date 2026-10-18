@@ -1,10 +1,7 @@
 //! Wayland side: one background layer surface ("wall") per output, wl_shm
 //! double buffering, fractional scaling, hotplug, and presenting.
 
-use std::{
-    path::PathBuf,
-    time::{Duration, Instant, SystemTime},
-};
+use std::{path::PathBuf, time::{Duration, Instant, SystemTime}};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -42,6 +39,8 @@ use smithay_client_toolkit::{
 
 use crate::config::{Config, ConfigSource};
 use crate::controller::Sim;
+use crate::hypr::HyprEvent;
+use crate::look::{self, Look};
 use crate::render::{self, Fade, Key, Renderer, Target, SENTINEL};
 use crate::state;
 use crate::sysload::CpuLoad;
@@ -140,16 +139,12 @@ impl Wall {
         self.bufs.clear();
         self.pool = None;
         let stride = (pw * 4) as i32;
-        let mut pool =
-            SlotPool::new(stride as usize * ph * 2, shm).expect("failed to create wl_shm pool");
+        let mut pool = SlotPool::new(stride as usize * ph * 2, shm).expect("failed to create wl_shm pool");
         for _ in 0..2 {
             let (buffer, _) = pool
                 .create_buffer(pw as i32, ph as i32, stride, wl_shm::Format::Xrgb8888)
                 .expect("failed to create wl_buffer");
-            self.bufs.push(Buf {
-                buffer,
-                shown: vec![SENTINEL; cols * rows],
-            });
+            self.bufs.push(Buf { buffer, shown: vec![SENTINEL; cols * rows] });
         }
         self.pool = Some(pool);
         self.display = vec![0; cols * rows];
@@ -167,36 +162,24 @@ impl Wall {
     }
 
     /// Show the current generation immediately (no fade) and commit it.
-    fn present(&mut self, r: &Renderer, cfg: &Config, hz: f64, qh: &QueueHandle<App>) {
+    fn present(&mut self, r: &Renderer, cfg: &Config, hz: f64, look: Look, qh: &QueueHandle<App>) {
         let Some(sim) = self.sim.as_ref() else { return };
         if self.bufs.len() != 2 {
             return;
         }
-        r.compose(sim, cfg, hz, self.fade.target_mut());
+        r.compose(sim, cfg, hz * sim.steps() as f64, look, self.fade.target_mut());
         self.fade.snap(&mut self.display);
         self.flush(r, qh);
     }
 
     /// A new generation was just simulated: start fading towards it.
-    fn next_generation(
-        &mut self,
-        r: &Renderer,
-        cfg: &Config,
-        hz: f64,
-        now: Instant,
-        interval: Duration,
-    ) {
+    fn next_generation(&mut self, r: &Renderer, cfg: &Config, hz: f64, look: Look, now: Instant, interval: Duration) {
         let Some(sim) = self.sim.as_ref() else { return };
         if self.bufs.len() != 2 {
             return;
         }
-        r.compose(sim, cfg, hz, self.fade.target_mut());
-        self.fade.begin(
-            &mut self.display,
-            now,
-            render::fade_duration(interval),
-            cfg.smooth,
-        );
+        r.compose(sim, cfg, hz * sim.steps() as f64, look, self.fade.target_mut());
+        self.fade.begin(&mut self.display, now, render::fade_duration(interval), cfg.smooth);
     }
 
     /// One animation frame: advance the crossfade, then commit if needed.
@@ -208,10 +191,7 @@ impl Wall {
         self.flush(r, qh);
         // Nothing to commit for a while? Send an empty commit with a frame
         // request so we can still tell when the wallpaper gets covered.
-        if cfg.pause_hidden
-            && !self.frame_pending
-            && now.saturating_duration_since(self.frame_sent) >= PROBE_EVERY
-        {
+        if cfg.pause_hidden && !self.frame_pending && now.saturating_duration_since(self.frame_sent) >= PROBE_EVERY {
             self.request_frame(qh, now);
             self.layer.commit();
         }
@@ -231,10 +211,7 @@ impl Wall {
     fn update_hidden(&mut self, now: Instant, cfg: &Config) {
         if !cfg.pause_hidden {
             self.hidden = false;
-        } else if self.frame_seen
-            && self.frame_pending
-            && now.saturating_duration_since(self.frame_sent) > HIDDEN_AFTER
-        {
+        } else if self.frame_seen && self.frame_pending && now.saturating_duration_since(self.frame_sent) > HIDDEN_AFTER {
             self.hidden = true;
         }
     }
@@ -246,9 +223,7 @@ impl Wall {
         if self.display == self.presented {
             return;
         }
-        let Some(pool) = self.pool.as_mut() else {
-            return;
-        };
+        let Some(pool) = self.pool.as_mut() else { return };
 
         for k in 0..2 {
             let idx = (self.next_buf + k) % 2;
@@ -256,22 +231,8 @@ impl Wall {
             let Some(canvas) = buffer.canvas(pool) else {
                 continue; // still held by the compositor
             };
-            let mut t = Target {
-                canvas,
-                w: self.px.0,
-                h: self.px.1,
-                cell: self.cell,
-                gap: self.gap,
-                cols: self.cols,
-                rows: self.rows,
-            };
-            r.draw(
-                &mut t,
-                &self.display,
-                shown,
-                &mut self.presented,
-                &mut self.damage,
-            );
+            let mut t = Target { canvas, w: self.px.0, h: self.px.1, cell: self.cell, gap: self.gap, cols: self.cols, rows: self.rows };
+            r.draw(&mut t, &self.display, shown, &mut self.presented, &mut self.damage);
 
             let surface = self.layer.wl_surface();
             if buffer.attach_to(surface).is_err() {
@@ -315,33 +276,32 @@ pub struct App {
     next_config_check: Instant,
     spawn: bool,
     pub exit: bool,
+    start: Instant,
+    look: Look,
+    local_min: Option<u32>,
+    next_clock: Instant,
+    pending: Vec<HyprEvent>,
 }
 
 impl App {
     pub fn new(
         globals: &GlobalList,
         qh: &QueueHandle<Self>,
+        compositor: CompositorState,
+        layer_shell: LayerShell,
+        shm: Shm,
         cfg: Config,
         src: ConfigSource,
         spawn: bool,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let compositor = CompositorState::bind(globals, qh)?;
-        let layer_shell = LayerShell::bind(globals, qh)
-            .map_err(|e| format!("compositor lacks zwlr_layer_shell_v1: {e}"))?;
-        let shm = Shm::bind(globals, qh)?;
-        let frac_mgr = globals
-            .bind::<WpFractionalScaleManagerV1, _, _>(qh, 1..=1, GlobalData)
-            .ok();
-        let viewporter = globals
-            .bind::<WpViewporter, _, _>(qh, 1..=1, GlobalData)
-            .ok();
+    ) -> Self {
+        let frac_mgr = globals.bind::<WpFractionalScaleManagerV1, _, _>(qh, 1..=1, GlobalData).ok();
+        let viewporter = globals.bind::<WpViewporter, _, _>(qh, 1..=1, GlobalData).ok();
         let (cfg_fps, cfg_save) = (cfg.fps, cfg.save_secs.max(1));
         let config_path = src.path.clone().or_else(ConfigSource::default_path);
-        let config_modified = config_path
-            .as_ref()
+        let config_modified = config_path.as_ref()
             .and_then(|p| std::fs::metadata(p).ok())
             .and_then(|m| m.modified().ok());
-        Ok(Self {
+        Self {
             registry_state: RegistryState::new(globals),
             output_state: OutputState::new(globals, qh),
             qh: qh.clone(),
@@ -363,7 +323,27 @@ impl App {
             next_config_check: Instant::now(),
             spawn,
             exit: false,
-        })
+            start: Instant::now(),
+            look: Look::default(),
+            local_min: look::local_minutes(),
+            next_clock: Instant::now() + Duration::from_secs(30),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Whether the Hyprland event socket should be watched at all.
+    pub fn hypr_enabled(&self) -> bool {
+        self.cfg.hypr_events
+    }
+
+    /// Hyprland events read from the socket; handled on the next tick.
+    pub fn push_events(&mut self, evs: &mut Vec<HyprEvent>) {
+        if self.cfg.hypr_events {
+            // a burst of events (workspace flicking) is capped; the sims also have a cooldown
+            let room = 32usize.saturating_sub(self.pending.len());
+            self.pending.extend(evs.drain(..).take(room));
+        }
+        evs.clear();
     }
 
     pub fn wall_count(&self) -> usize {
@@ -377,12 +357,15 @@ impl App {
     /// Time between generations (CPU load speeds it up in `sysload` mode).
     pub fn interval(&self) -> Duration {
         let base = 1.0 / self.cfg.fps;
-        let factor = if self.cfg.sysload {
-            0.6 + 2.4 * self.load.value() as f64
+        let load = if self.cfg.sysload { 0.6 + 2.4 * self.load.value() as f64 } else { 1.0 };
+        // the tempo slowly swells and ebbs
+        let breath = if self.cfg.breathe > 0.0 {
+            let phase = self.start.elapsed().as_secs_f64() / self.cfg.breathe_secs.max(1) as f64 * std::f64::consts::TAU;
+            1.0 + self.cfg.breathe * phase.sin()
         } else {
             1.0
         };
-        Duration::from_secs_f64(base / factor)
+        Duration::from_secs_f64(base / (load * breath).max(0.05))
     }
 
     fn hz(&self) -> f64 {
@@ -410,6 +393,11 @@ impl App {
             self.next_config_check = now + Duration::from_millis(500);
             self.check_config_file();
         }
+        if now >= self.next_clock {
+            self.next_clock = now + Duration::from_secs(30);
+            self.local_min = look::local_minutes();
+        }
+        self.look = look::compute(&self.cfg, now.duration_since(self.start), self.local_min);
         let gen_due = now >= self.next_gen;
         if gen_due {
             if self.cfg.sysload && now >= self.next_sample {
@@ -421,21 +409,20 @@ impl App {
             let next = self.next_gen + iv;
             self.next_gen = if next > now { next } else { now + iv };
         }
-        let load = if self.cfg.sysload {
-            self.load.value()
-        } else {
-            0.0
-        };
+        let load = if self.cfg.sysload { self.load.value() } else { 0.0 };
         let hz = self.hz();
         let interval = self.interval();
-        let App {
-            walls,
-            cfg,
-            renderer,
-            qh,
-            ..
-        } = &mut *self;
+        let look = self.look;
+        let events = std::mem::take(&mut self.pending);
+        let App { walls, cfg, renderer, qh, .. } = &mut *self;
         for w in walls.iter_mut() {
+            if !w.hidden {
+                if let Some(sim) = w.sim.as_mut() {
+                    for &ev in &events {
+                        sim.on_event(ev, now, cfg);
+                    }
+                }
+            }
             w.update_hidden(now, cfg);
             if w.hidden {
                 continue; // covered: no simulating, no drawing
@@ -446,14 +433,14 @@ impl App {
                 if let Some(sim) = w.sim.as_mut() {
                     sim.resume(now, cfg);
                 }
-                w.present(renderer, cfg, hz, qh);
+                w.present(renderer, cfg, hz, look, qh);
                 continue;
             }
             if gen_due {
                 if let Some(sim) = w.sim.as_mut() {
                     sim.tick(now, cfg, load);
                 }
-                w.next_generation(renderer, cfg, hz, now, interval);
+                w.next_generation(renderer, cfg, hz, look, now, interval);
             }
             w.frame(renderer, cfg, qh, now);
         }
@@ -467,7 +454,7 @@ impl App {
     fn save_all(&self) {
         for w in &self.walls {
             if let (Some(sim), Some(path)) = (w.sim.as_ref(), w.state_path.as_ref()) {
-                if let Err(e) = state::save(path, &sim.life) {
+                if let Err(e) = state::save(path, &sim.life, sim.base_rule()) {
                     eprintln!("life-wallpaper: could not save {}: {e}", path.display());
                 }
             }
@@ -477,9 +464,7 @@ impl App {
     /// Poll the config file so edits apply automatically without a signal/restart.
     /// Metadata polling is cheap and avoids adding a platform-specific watcher.
     fn check_config_file(&mut self) {
-        let modified = self
-            .config_path
-            .as_ref()
+        let modified = self.config_path.as_ref()
             .and_then(|p| std::fs::metadata(p).ok())
             .and_then(|m| m.modified().ok());
         if modified != self.config_modified {
@@ -490,9 +475,7 @@ impl App {
     /// Re-read config file + CLI overrides and rebuild every wall.
     /// Also refresh the timestamp after failed reloads to avoid retrying every frame.
     pub fn reload_config(&mut self) {
-        self.config_modified = self
-            .config_path
-            .as_ref()
+        self.config_modified = self.config_path.as_ref()
             .and_then(|p| std::fs::metadata(p).ok())
             .and_then(|m| m.modified().ok());
         match self.src.load() {
@@ -500,26 +483,16 @@ impl App {
                 new.output = self.cfg.output.clone(); // output filter needs a restart
                 self.cfg = new;
                 self.renderer = Renderer::new(&self.cfg);
-                let (now, hz) = (Instant::now(), self.hz());
-                let names: Vec<Option<String>> = self
-                    .walls
-                    .iter()
-                    .map(|w| self.output_state.info(&w.output).and_then(|i| i.name))
-                    .collect();
-                let App {
-                    walls,
-                    cfg,
-                    shm,
-                    renderer,
-                    qh,
-                    ..
-                } = self;
+                let (now, hz, look) = (Instant::now(), self.hz(), self.look);
+                let names: Vec<Option<String>> =
+                    self.walls.iter().map(|w| self.output_state.info(&w.output).and_then(|i| i.name)).collect();
+                let App { walls, cfg, shm, renderer, qh, .. } = self;
                 for (w, name) in walls.iter_mut().zip(&names) {
                     if let Some(sim) = w.sim.as_mut() {
                         sim.reconfigure(now, cfg);
                     }
                     w.rebuild(cfg, shm, now, name.as_deref());
-                    w.present(renderer, cfg, hz, qh);
+                    w.present(renderer, cfg, hz, look, qh);
                 }
                 eprintln!("life-wallpaper: config reloaded");
             }
@@ -536,28 +509,16 @@ impl App {
     }
 
     fn wall_idx(&self, surface: &WlSurface) -> Option<usize> {
-        self.walls
-            .iter()
-            .position(|w| w.layer.wl_surface() == surface)
+        self.walls.iter().position(|w| w.layer.wl_surface() == surface)
     }
 
     fn refresh(&mut self, i: usize) {
-        let hz = self.hz();
-        let name = self
-            .output_state
-            .info(&self.walls[i].output)
-            .and_then(|o| o.name);
-        let App {
-            walls,
-            cfg,
-            shm,
-            renderer,
-            qh,
-            ..
-        } = self;
+        let (hz, look) = (self.hz(), self.look);
+        let name = self.output_state.info(&self.walls[i].output).and_then(|o| o.name);
+        let App { walls, cfg, shm, renderer, qh, .. } = self;
         let w = &mut walls[i];
         w.rebuild(cfg, shm, Instant::now(), name.as_deref());
-        w.present(renderer, cfg, hz, qh);
+        w.present(renderer, cfg, hz, look, qh);
     }
 
     /// Create a wall for `output` if it passes the `--output` filter.
@@ -572,13 +533,7 @@ impl App {
             }
         }
         let surface = self.compositor.create_surface(qh);
-        let layer = self.layer_shell.create_layer_surface(
-            qh,
-            surface,
-            Layer::Background,
-            Some("life-wallpaper"),
-            Some(output),
-        );
+        let layer = self.layer_shell.create_layer_surface(qh, surface, Layer::Background, Some("life-wallpaper"), Some(output));
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -587,10 +542,7 @@ impl App {
         let (fractional, viewport) = match (&self.frac_mgr, &self.viewporter) {
             (Some(m), Some(v)) => {
                 let s = layer.wl_surface();
-                (
-                    Some(m.get_fractional_scale(s, qh, s.clone())),
-                    Some(v.get_viewport(s, qh, GlobalData)),
-                )
+                (Some(m.get_fractional_scale(s, qh, s.clone())), Some(v.get_viewport(s, qh, GlobalData)))
             }
             _ => (None, None),
         };
@@ -630,8 +582,7 @@ impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
         // Output went away (or compositor revoked us): drop that wall and keep
         // running so a re-plugged monitor gets a fresh one.
-        self.walls
-            .retain(|w| w.layer.wl_surface() != layer.wl_surface());
+        self.walls.retain(|w| w.layer.wl_surface() != layer.wl_surface());
     }
 
     fn configure(
@@ -642,9 +593,7 @@ impl LayerShellHandler for App {
         configure: LayerSurfaceConfigure,
         _serial: u32, // SCTK already acked this configure
     ) {
-        let Some(i) = self.wall_idx(layer.wl_surface()) else {
-            return;
-        };
+        let Some(i) = self.wall_idx(layer.wl_surface()) else { return };
         let (w, h) = configure.new_size;
         let size = (if w == 0 { 1920 } else { w }, if h == 0 { 1080 } else { h });
         let wall = &mut self.walls[i];
@@ -653,27 +602,15 @@ impl LayerShellHandler for App {
             self.refresh(i);
         } else {
             wall.presented.fill(SENTINEL); // answer the configure with a full commit
-            let hz = self.hz();
-            let App {
-                walls,
-                cfg,
-                renderer,
-                qh,
-                ..
-            } = self;
-            walls[i].present(renderer, cfg, hz, qh);
+            let (hz, look) = (self.hz(), self.look);
+            let App { walls, cfg, renderer, qh, .. } = self;
+            walls[i].present(renderer, cfg, hz, look, qh);
         }
     }
 }
 
 impl CompositorHandler for App {
-    fn scale_factor_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        surface: &WlSurface,
-        new_factor: i32,
-    ) {
+    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &WlSurface, new_factor: i32) {
         // Integer-scale fallback; with fractional-scale the protocol event wins.
         if let Some(i) = self.wall_idx(surface) {
             let s = new_factor.max(1) as u32 * 120;
@@ -683,14 +620,7 @@ impl CompositorHandler for App {
             }
         }
     }
-    fn transform_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlSurface,
-        _: wl_output::Transform,
-    ) {
-    }
+    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: wl_output::Transform) {}
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &WlSurface, _: u32) {
         // The compositor drew (or can draw) our surface again.
         if let Some(i) = self.wall_idx(surface) {
@@ -703,22 +633,8 @@ impl CompositorHandler for App {
             }
         }
     }
-    fn surface_enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-    fn surface_leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
+    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: &wl_output::WlOutput) {}
 }
 
 impl OutputHandler for App {
@@ -728,20 +644,10 @@ impl OutputHandler for App {
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         self.maybe_add_wall(qh, &output);
     }
-    fn update_output(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        output: wl_output::WlOutput,
-    ) {
+    fn update_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         self.maybe_add_wall(qh, &output); // names can arrive late
     }
-    fn output_destroyed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        output: wl_output::WlOutput,
-    ) {
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
         self.walls.retain(|w| w.output != output);
     }
 }
@@ -762,53 +668,25 @@ impl ProvidesRegistryState for App {
 // --- fractional scale + viewporter plumbing -------------------------------
 
 impl Dispatch<WpFractionalScaleManagerV1, GlobalData> for App {
-    fn event(
-        _: &mut Self,
-        _: &WpFractionalScaleManagerV1,
-        _: <WpFractionalScaleManagerV1 as Proxy>::Event,
-        _: &GlobalData,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+    fn event(_: &mut Self, _: &WpFractionalScaleManagerV1, _: <WpFractionalScaleManagerV1 as Proxy>::Event, _: &GlobalData, _: &Connection, _: &QueueHandle<Self>) {
         unreachable!("wp_fractional_scale_manager_v1 has no events")
     }
 }
 
 impl Dispatch<WpViewporter, GlobalData> for App {
-    fn event(
-        _: &mut Self,
-        _: &WpViewporter,
-        _: <WpViewporter as Proxy>::Event,
-        _: &GlobalData,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+    fn event(_: &mut Self, _: &WpViewporter, _: <WpViewporter as Proxy>::Event, _: &GlobalData, _: &Connection, _: &QueueHandle<Self>) {
         unreachable!("wp_viewporter has no events")
     }
 }
 
 impl Dispatch<WpViewport, GlobalData> for App {
-    fn event(
-        _: &mut Self,
-        _: &WpViewport,
-        _: <WpViewport as Proxy>::Event,
-        _: &GlobalData,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+    fn event(_: &mut Self, _: &WpViewport, _: <WpViewport as Proxy>::Event, _: &GlobalData, _: &Connection, _: &QueueHandle<Self>) {
         unreachable!("wp_viewport has no events")
     }
 }
 
 impl Dispatch<WpFractionalScaleV1, WlSurface> for App {
-    fn event(
-        state: &mut Self,
-        _: &WpFractionalScaleV1,
-        event: wp_fractional_scale_v1::Event,
-        surface: &WlSurface,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+    fn event(state: &mut Self, _: &WpFractionalScaleV1, event: wp_fractional_scale_v1::Event, surface: &WlSurface, _: &Connection, _: &QueueHandle<Self>) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             if let Some(i) = state.wall_idx(surface) {
                 if state.walls[i].scale120 != scale {
