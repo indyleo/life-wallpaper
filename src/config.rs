@@ -13,6 +13,15 @@ pub enum RuleSel {
     Rotate,
 }
 
+/// How a rule shift is applied to the board.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShiftMode {
+    /// The whole board changes rule at once and back again (a pulse).
+    Global,
+    /// Tiles change rule one ring at a time, starting at a random tile (a ripple).
+    Ripple,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ColorMode {
     Age,
@@ -96,6 +105,10 @@ pub struct Config {
     /// How many generations each swap lasts (generations, so it does not
     /// depend on `fps`).
     pub rule_shift_gens: u32,
+    /// `ripple` (tile by tile) or `global` (whole board at once).
+    pub rule_shift_mode: ShiftMode,
+    /// Ripple only: generations between one ring of tiles and the next.
+    pub rule_shift_stagger: u32,
     /// Run several generations per tick while the board is calm.
     pub fastforward: bool,
     pub fastforward_speed: u32,
@@ -112,6 +125,18 @@ pub struct Config {
     pub symmetry_chance: f64,
     /// React to Hyprland events (workspace switch, window open / close).
     pub hypr_events: bool,
+    /// Ask Hyprland where a window is, so a closed window blooms where it was
+    /// and a new one gets a halo around it. Falls back to random spots.
+    pub hypr_locate: bool,
+    /// Every this many seconds a stamp spells the time (HH:MM). 0 = off.
+    pub clock_stamp_secs: u64,
+    // ---- audio ----
+    /// Gliders on beats, from a PipeWire capture of the default output. Off by default.
+    pub audio: bool,
+    /// Beat detector sensitivity: higher reacts to softer beats.
+    pub audio_sensitivity: f64,
+    /// Command that writes raw mono s16le audio at 11025 Hz to stdout.
+    pub audio_command: String,
     // ---- look ----
     /// Generation rate swings by +-this fraction over `breathe_secs`. 0 = off.
     pub breathe: f64,
@@ -172,6 +197,8 @@ impl Default for Config {
             noise_per_sec: 1.5,
             rule_shift_secs: 45,
             rule_shift_gens: 10,
+            rule_shift_mode: ShiftMode::Ripple,
+            rule_shift_stagger: 3,
             fastforward: true,
             fastforward_speed: 4,
             colonies: true,
@@ -182,6 +209,11 @@ impl Default for Config {
             gun_secs: 60,
             symmetry_chance: 0.25,
             hypr_events: true,
+            hypr_locate: true,
+            clock_stamp_secs: 600,
+            audio: false,
+            audio_sensitivity: 1.0,
+            audio_command: DEFAULT_AUDIO_COMMAND.to_string(),
             breathe: 0.3,
             breathe_secs: 90,
             glow: 0.25,
@@ -207,6 +239,11 @@ impl Default for Config {
     }
 }
 
+/// PipeWire's own recorder, pointed at the monitor of the default output
+/// (whatever is playing), raw mono 16-bit at 11025 Hz on stdout (the rate the beat detector assumes).
+pub const DEFAULT_AUDIO_COMMAND: &str =
+    "pw-cat --record --format s16 --rate 11025 --channels 1 -P {stream.capture.sink=true} -";
+
 /// Gruvbox bright: yellow, green, orange, red, aqua, blue, purple.
 pub fn default_colonies() -> Vec<Rgb> {
     vec![
@@ -222,7 +259,7 @@ pub fn default_colonies() -> Vec<Rgb> {
 
 pub const BOOL_KEYS: &[&str] = &[
     "trail", "rain", "overlay", "sysload", "patterns", "stamps", "smooth", "persist", "pause_hidden", "cell_round",
-    "fastforward", "colonies", "traffic", "hypr_events",
+    "fastforward", "colonies", "traffic", "hypr_events", "hypr_locate", "audio",
 ];
 
 pub fn parse_color(s: &str) -> Result<Rgb, String> {
@@ -329,6 +366,14 @@ impl Config {
             "noise_per_sec" => self.noise_per_sec = num(val, 0.0, 200.0)?,
             "rule_shift_secs" => self.rule_shift_secs = num(val, 0, 86_400)?,
             "rule_shift_gens" => self.rule_shift_gens = num(val, 2, 200)?,
+            "rule_shift_mode" => {
+                self.rule_shift_mode = match val.to_ascii_lowercase().as_str() {
+                    "ripple" => ShiftMode::Ripple,
+                    "global" => ShiftMode::Global,
+                    _ => return Err(format!("unknown rule_shift_mode {val:?} (ripple or global)")),
+                }
+            }
+            "rule_shift_stagger" => self.rule_shift_stagger = num(val, 0, 50)?,
             "fastforward" => self.fastforward = parse_bool(val)?,
             "fastforward_speed" => self.fastforward_speed = num(val, 2, 12)?,
             "colonies" => self.colonies = parse_bool(val)?,
@@ -340,6 +385,16 @@ impl Config {
             "gun_secs" => self.gun_secs = num(val, 0, 86_400)?,
             "symmetry_chance" => self.symmetry_chance = num(val, 0.0, 1.0)?,
             "hypr_events" => self.hypr_events = parse_bool(val)?,
+            "hypr_locate" => self.hypr_locate = parse_bool(val)?,
+            "clock_stamp_secs" => self.clock_stamp_secs = num(val, 0, 86_400)?,
+            "audio" => self.audio = parse_bool(val)?,
+            "audio_sensitivity" => self.audio_sensitivity = num(val, 0.2, 5.0)?,
+            "audio_command" => {
+                if val.split_whitespace().next().is_none() {
+                    return Err("audio_command is empty".into());
+                }
+                self.audio_command = val.to_string()
+            }
             "breathe" => self.breathe = num(val, 0.0, 0.8)?,
             "breathe_secs" => self.breathe_secs = num(val, 5, 86_400)?,
             "glow" => self.glow = num(val, 0.0, 1.0)?,
@@ -518,6 +573,8 @@ usage: life-wallpaper [options]
       --noise-per-sec N       random single-cell disturbances per second (default 1.5)
       --rule-shift-secs S     briefly swap the rule every S seconds (0 = off, default 45)
       --rule-shift-gens N     how many generations each swap lasts (default 10)
+      --rule-shift-mode MODE  ripple (tile by tile, default) | global (whole board at once)
+      --rule-shift-stagger N  ripple: generations between one ring of tiles and the next (default 3)
       --[no-]fastforward      run extra generations per tick while the board is calm
       --fastforward-speed N   generations per tick while fast-forwarding (default 4)
       --[no-]colonies         births inherit their parents' colour (needs --color age)
@@ -527,6 +584,13 @@ usage: life-wallpaper [options]
       --gun-secs S            lifetime of a Gosper gun (0 = forever, default 60)
       --symmetry-chance P     chance an injected soup is symmetric (default 0.25)
       --[no-]hypr-events      react to Hyprland workspace / window events
+      --[no-]hypr-locate      ask Hyprland where windows are, so life appears there (default on)
+      --clock-stamp-secs S    stamp the time (HH:MM) every ~S seconds (0 = off, default 600)
+
+  audio (needs PipeWire's pw-cat; read once at start-up, restart to change):
+      --[no-]audio            gliders on beats of whatever is playing (default off)
+      --audio-sensitivity X   0.2..5, higher reacts to softer beats (default 1)
+      --audio-command CMD     raw mono s16le @ 11025 Hz on stdout (default: pw-cat on the default sink monitor)
 
   look:
       --breathe DEPTH         generation rate swings by +-DEPTH over --breathe-secs (0 = off, default 0.3)
@@ -623,6 +687,28 @@ mod tests {
         }
         assert!(!cfg.colonies && !cfg.hypr_events);
         assert_eq!((cfg.glow, cfg.fastforward_speed), (0.5, 6));
+    }
+
+    #[test]
+    fn ripple_window_clock_and_audio_keys() {
+        let mut c = Config::default();
+        assert_eq!(c.rule_shift_mode, ShiftMode::Ripple);
+        assert!(!c.audio && c.hypr_locate);
+        c.apply_toml("rule_shift_mode = \"global\"\nrule_shift_stagger = 0\nclock_stamp_secs = 0\naudio = true\naudio_sensitivity = 2\nhypr_locate = false\n").unwrap();
+        assert_eq!(c.rule_shift_mode, ShiftMode::Global);
+        assert_eq!((c.rule_shift_stagger, c.clock_stamp_secs), (0, 0));
+        assert!(c.audio && !c.hypr_locate);
+        assert!(c.apply_toml("rule_shift_mode = \"wave\"").is_err());
+        assert!(c.apply_toml("audio_sensitivity = 9").is_err());
+        assert!(c.apply_toml("audio_command = \"\"").is_err());
+        c.apply_toml("audio_command = \"parec --format=s16le --rate=11025 --channels=1\"").unwrap();
+        assert!(c.audio_command.starts_with("parec"));
+        let cli = parse_cli(["--audio", "--no-hypr-locate", "--rule-shift-mode=global"].iter().map(|s| s.to_string())).unwrap();
+        let mut cfg = Config::default();
+        for (k, v) in &cli.source.cli {
+            cfg.set(k, v).unwrap();
+        }
+        assert!(cfg.audio && !cfg.hypr_locate && cfg.rule_shift_mode == ShiftMode::Global);
     }
 
     #[test]

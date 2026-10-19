@@ -38,8 +38,8 @@ use smithay_client_toolkit::{
 };
 
 use crate::config::{Config, ConfigSource};
-use crate::controller::Sim;
-use crate::hypr::HyprEvent;
+use crate::controller::{Sim, Spot};
+use crate::hypr::{self, Placed, Raw};
 use crate::look::{self, Look};
 use crate::render::{self, Fade, Key, Renderer, Target, SENTINEL};
 use crate::state;
@@ -280,7 +280,9 @@ pub struct App {
     look: Look,
     local_min: Option<u32>,
     next_clock: Instant,
-    pending: Vec<HyprEvent>,
+    pending: Vec<Placed>,
+    hypr: hypr::Tracker,
+    beats: Vec<f32>,
 }
 
 impl App {
@@ -297,6 +299,7 @@ impl App {
         let frac_mgr = globals.bind::<WpFractionalScaleManagerV1, _, _>(qh, 1..=1, GlobalData).ok();
         let viewporter = globals.bind::<WpViewporter, _, _>(qh, 1..=1, GlobalData).ok();
         let (cfg_fps, cfg_save) = (cfg.fps, cfg.save_secs.max(1));
+        let locate = cfg.hypr_events && cfg.hypr_locate;
         let config_path = src.path.clone().or_else(ConfigSource::default_path);
         let config_modified = config_path.as_ref()
             .and_then(|p| std::fs::metadata(p).ok())
@@ -328,6 +331,8 @@ impl App {
             local_min: look::local_minutes(),
             next_clock: Instant::now() + Duration::from_secs(30),
             pending: Vec::new(),
+            hypr: hypr::Tracker::new(locate, hypr::socket_path().is_some(), Instant::now()),
+            beats: Vec::new(),
         }
     }
 
@@ -336,14 +341,36 @@ impl App {
         self.cfg.hypr_events
     }
 
-    /// Hyprland events read from the socket; handled on the next tick.
-    pub fn push_events(&mut self, evs: &mut Vec<HyprEvent>) {
+    /// Lines read from Hyprland's event socket. Events that can be answered
+    /// now are queued for the next tick; opens wait for the window's geometry.
+    pub fn push_events(&mut self, raws: &mut Vec<Raw>) {
         if self.cfg.hypr_events {
+            let now = Instant::now();
+            for raw in raws.drain(..) {
+                self.hypr.on_raw(raw, now, &mut self.pending);
+            }
             // a burst of events (workspace flicking) is capped; the sims also have a cooldown
-            let room = 32usize.saturating_sub(self.pending.len());
-            self.pending.extend(evs.drain(..).take(room));
+            self.pending.truncate(32);
         }
-        evs.clear();
+        raws.clear();
+    }
+
+    /// Whether the audio helper should be started (read once at start-up).
+    pub fn audio_enabled(&self) -> bool {
+        self.cfg.audio
+    }
+    pub fn audio_command(&self) -> &str {
+        &self.cfg.audio_command
+    }
+    pub fn audio_sensitivity(&self) -> f64 {
+        self.cfg.audio_sensitivity
+    }
+
+    /// A beat from the audio meter; handled on the next tick.
+    pub fn push_beat(&mut self, strength: f32) {
+        if self.beats.len() < 8 {
+            self.beats.push(strength);
+        }
     }
 
     pub fn wall_count(&self) -> usize {
@@ -413,13 +440,41 @@ impl App {
         let hz = self.hz();
         let interval = self.interval();
         let look = self.look;
+        let local_min = self.local_min;
+        // Window geometry: refresh the cache when an event asked for it, then
+        // release the opens that were waiting for it.
+        if self.hypr.refresh_due(now) {
+            let (clients, monitors) = (hypr::query("j/clients"), hypr::query("j/monitors"));
+            self.hypr.refresh(clients.as_deref(), monitors.as_deref());
+        }
+        self.hypr.ready(now, &mut self.pending);
         let events = std::mem::take(&mut self.pending);
-        let App { walls, cfg, renderer, qh, .. } = &mut *self;
-        for w in walls.iter_mut() {
+        let beats = std::mem::take(&mut self.beats);
+        let App { walls, cfg, renderer, qh, output_state, .. } = &mut *self;
+        let names: Vec<Option<String>> = if events.iter().any(|e| e.place.is_some()) {
+            walls.iter().map(|w| output_state.info(&w.output).and_then(|i| i.name)).collect()
+        } else {
+            Vec::new()
+        };
+        for (n, w) in walls.iter_mut().enumerate() {
             if !w.hidden {
+                let (cols, rows) = (w.cols, w.rows);
                 if let Some(sim) = w.sim.as_mut() {
-                    for &ev in &events {
-                        sim.on_event(ev, now, cfg);
+                    for ev in &events {
+                        match &ev.place {
+                            // nobody knows where: every output reacts at a random spot
+                            None => sim.on_event(ev.ev, now, cfg),
+                            // known: only the output the window is on reacts, at its spot
+                            Some(p) if names.get(n).and_then(|nm| nm.as_deref()) == Some(p.monitor.as_str()) => {
+                                if let Some(spot) = Spot::from_px(p.x, p.y, p.w, p.h, cfg.cell_size, cols, rows) {
+                                    sim.on_event_at(ev.ev, spot, now, cfg);
+                                }
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    for &strength in &beats {
+                        sim.on_beat(strength, now);
                     }
                 }
             }
@@ -438,6 +493,7 @@ impl App {
             }
             if gen_due {
                 if let Some(sim) = w.sim.as_mut() {
+                    sim.set_clock(local_min);
                     sim.tick(now, cfg, load);
                 }
                 w.next_generation(renderer, cfg, hz, look, now, interval);
@@ -481,7 +537,14 @@ impl App {
         match self.src.load() {
             Ok(mut new) => {
                 new.output = self.cfg.output.clone(); // output filter needs a restart
+                new.audio = self.cfg.audio; // so does the audio helper
+                new.audio_command = self.cfg.audio_command.clone();
                 self.cfg = new;
+                self.hypr = hypr::Tracker::new(
+                    self.cfg.hypr_events && self.cfg.hypr_locate,
+                    hypr::socket_path().is_some(),
+                    Instant::now(),
+                );
                 self.renderer = Renderer::new(&self.cfg);
                 let (now, hz, look) = (Instant::now(), self.hz(), self.look);
                 let names: Vec<Option<String>> =

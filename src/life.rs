@@ -139,6 +139,15 @@ fn inherit(cur: &[u8], colony: &[u8], nb: [usize; 8], nc: u8, mut_thr: u32, rng:
     0
 }
 
+/// A second life-like rule that applies only to the cells marked in `mask`.
+/// Used for rule ripples: the controller switches tiles over one at a time.
+struct Alt {
+    birth: u16,
+    survive: u16,
+    /// One byte per cell, 1 = this cell follows the alternative rule.
+    mask: Vec<u8>,
+}
+
 pub struct Life {
     cols: usize,
     rows: usize,
@@ -166,6 +175,7 @@ pub struct Life {
     decay_after: u8,
     /// ... with this per-generation probability (scaled to u32).
     decay_thr: u32,
+    alt: Option<Alt>,
     rng: u64,
 }
 
@@ -199,8 +209,49 @@ impl Life {
             brush: 0,
             decay_after: 0,
             decay_thr: 0,
+            alt: None,
             rng: rand::thread_rng().gen::<u64>() | 1,
         }
+    }
+
+    /// Fix the generator `step` uses for colony mutation and decay, so a
+    /// simulation can be replayed exactly (tests).
+    pub fn seed_rng(&mut self, seed: u64) {
+        self.rng = seed | 1;
+    }
+
+    /// Start a rule ripple: cells marked later with `alt_rect` follow `rule`
+    /// instead of the board's rule. Only between life-like rules; false (and
+    /// nothing changes) otherwise.
+    pub fn begin_alt(&mut self, rule: Rule) -> bool {
+        match (self.rule, rule) {
+            (Rule::LifeLike { .. }, Rule::LifeLike { birth, survive }) => {
+                self.alt = Some(Alt { birth, survive, mask: vec![0; self.cur.len()] });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mark (or unmark) a rectangle of cells for the alternative rule.
+    pub fn alt_rect(&mut self, x: usize, y: usize, w: usize, h: usize, on: bool) {
+        let cols = self.cols;
+        if let Some(a) = self.alt.as_mut() {
+            for yy in y..(y + h).min(self.rows) {
+                a.mask[yy * cols + x.min(cols)..yy * cols + (x + w).min(cols)].fill(on as u8);
+            }
+        }
+    }
+
+    /// Back to one rule for the whole board.
+    pub fn end_alt(&mut self) {
+        self.alt = None;
+    }
+
+    /// How many cells currently follow the alternative rule.
+    #[cfg(test)]
+    pub fn alt_cells(&self) -> usize {
+        self.alt.as_ref().map_or(0, |a| a.mask.iter().filter(|&&m| m != 0).count())
     }
 
     pub fn cols(&self) -> usize {
@@ -346,6 +397,7 @@ impl Life {
         self.next = vec![0; cols * rows];
         self.hist = vec![0; cols * rows];
         self.settled = vec![0; cols * rows];
+        self.alt = None; // its mask no longer fits
         self.cols = cols;
         self.rows = rows;
     }
@@ -353,7 +405,8 @@ impl Life {
     /// Advance one generation (edges wrap). Returns `true` if any cell changed.
     pub fn step(&mut self) -> bool {
         let changed = match self.rule {
-            Rule::LifeLike { birth, survive } => self.step_lifelike(birth, survive),
+            Rule::LifeLike { birth, survive } if self.alt.is_some() => self.step_lifelike::<true>(birth, survive),
+            Rule::LifeLike { birth, survive } => self.step_lifelike::<false>(birth, survive),
             Rule::Brain => self.step_brain(),
         };
         // Age + death-trail + settledness bookkeeping, one pass. Cells that
@@ -388,9 +441,16 @@ impl Life {
         changed
     }
 
-    fn step_lifelike(&mut self, birth: u16, survive: u16) -> bool {
+    /// `MIXED` = some cells follow the alternative rule (`self.alt`). The plain
+    /// path is compiled without the per-cell lookup, so a board with no ripple
+    /// running costs exactly what it did before.
+    fn step_lifelike<const MIXED: bool>(&mut self, birth: u16, survive: u16) -> bool {
         let (cols, rows) = (self.cols, self.rows);
         let (cur, next, colony) = (&self.cur, &mut self.next, &mut self.colony);
+        let (alt_mask, alt_b, alt_s): (&[u8], u16, u16) = match (MIXED, self.alt.as_ref()) {
+            (true, Some(a)) => (&a.mask, a.birth, a.survive),
+            _ => (&[], birth, survive),
+        };
         let (nc, mut_thr) = (self.ncolonies, self.mutation);
         let mut rng = self.rng;
         let mut changed = false;
@@ -410,7 +470,8 @@ impl Life {
                     + cur[down + x]
                     + cur[down + r];
                 let alive = cur[row + x];
-                let mask = if alive == 1 { survive } else { birth };
+                let (b, sv) = if MIXED && alt_mask[row + x] != 0 { (alt_b, alt_s) } else { (birth, survive) };
+                let mask = if alive == 1 { sv } else { b };
                 let v = (mask >> n & 1) as u8;
                 next[row + x] = v;
                 changed |= v != alive;

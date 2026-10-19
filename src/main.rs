@@ -2,6 +2,7 @@
 //! One process drives every output (hotplug aware); `--output NAME` limits it to one.
 //! See `life-wallpaper --help`.
 
+mod audio;
 mod config;
 mod controller;
 mod font;
@@ -117,6 +118,48 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Ok(PostAction::Continue)
                 })
                 .expect("failed to register Hyprland event source");
+        }
+    }
+
+    // Audio reactivity: a helper process (pw-cat by default) feeds raw samples
+    // through a pipe into the beat detector. Opt-in, and read once at start-up.
+    if app.audio_enabled() {
+        match audio::spawn(app.audio_command()) {
+            Ok((helper, stdout)) => {
+                let mut detector = audio::BeatDetector::new(app.audio_sensitivity());
+                handle
+                    .insert_source(Generic::new(stdout, Interest::READ, Mode::Level), move |_, out, app: &mut App| {
+                        let _keep_alive = &helper; // dropped (and the helper stopped) with this source
+                        let mut buf = [0u8; 8192];
+                        let mut strongest: Option<f32> = None;
+                        let mut closed = false;
+                        loop {
+                            match audio::read_nonblocking(&**out, &mut buf) {
+                                Ok(audio::Read::Data(n)) => {
+                                    if let Some(s) = detector.feed(&buf[..n]) {
+                                        strongest = Some(strongest.map_or(s, |b: f32| b.max(s)));
+                                    }
+                                }
+                                Ok(audio::Read::Empty) => break,
+                                Ok(audio::Read::Closed) => {
+                                    closed = true;
+                                    break;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        if let Some(s) = strongest {
+                            app.push_beat(s);
+                        }
+                        if closed {
+                            eprintln!("life-wallpaper: the audio helper exited; no more beats");
+                            return Ok(PostAction::Remove);
+                        }
+                        Ok(PostAction::Continue)
+                    })
+                    .expect("failed to register audio source");
+            }
+            Err(e) => eprintln!("life-wallpaper: audio = true, but could not start {:?}: {e}", app.audio_command()),
         }
     }
 

@@ -179,8 +179,10 @@ Cells stuck in a still life or oscillator for this many generations die with the
 .B noise_per_sec
 Random single-cell disturbances per second.
 .TP
-.BR rule_shift_secs ", " rule_shift_gens
+.BR rule_shift_secs ", " rule_shift_gens ", " rule_shift_mode ", " rule_shift_stagger
 Briefly swap to a livelier rule (B34/S23, B3/S234 or B3/S2345) on Life and HighLife boards.
+In ripple mode (the default) tiles switch over ring by ring from a random tile, each for
+rule_shift_gens generations, rule_shift_stagger generations apart; in global mode the whole board changes at once.
 .TP
 .BR fastforward ", " fastforward_speed
 Run extra generations per tick while the whole board is calm.
@@ -196,6 +198,16 @@ Chance that an injected soup is symmetric.
 .TP
 .B hypr_events
 React to Hyprland workspace and window events.
+.TP
+.B hypr_locate
+Ask Hyprland where a window is, so a closed window blooms where it was and a new one gets a halo around it.
+.TP
+.B clock_stamp_secs
+Every so many seconds a stamp spells the local time as HH:MM (0 = off; requires stamps).
+.TP
+.BR audio ", " audio_sensitivity ", " audio_command
+Gliders on beats, from a helper process (default: pw-cat on the default output's monitor) writing raw mono
+16-bit samples at 11025 Hz to stdout. Off by default; read at start-up.
 .TP
 .BR breathe ", " breathe_secs
 Slowly vary the generation rate by this fraction.
