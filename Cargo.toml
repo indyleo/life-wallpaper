@@ -2,6 +2,7 @@
 name = "life-wallpaper"
 version = "0.1.0"
 edition = "2021"
+default-run = "life-wallpaper"
 description = "Conway's Game of Life as a native Wayland wallpaper (wlr-layer-shell, wl_shm)"
 
 [dependencies]

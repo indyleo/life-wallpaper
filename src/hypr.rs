@@ -76,6 +76,12 @@ fn norm_addr(a: &str) -> String {
 }
 
 /// One `name>>data` line; `None` for events we do not care about.
+/// `cursorpos` answers `1234, 567`.
+pub fn parse_cursorpos(text: &str) -> Option<(f64, f64)> {
+    let (x, y) = text.trim().split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
 pub fn parse_line(line: &str) -> Option<Raw> {
     let (name, data) = line.split_once(">>").unwrap_or((line, ""));
     let addr = |d: &str| d.split(',').next().map(norm_addr).filter(|a| !a.is_empty());
@@ -84,8 +90,9 @@ pub fn parse_line(line: &str) -> Option<Raw> {
         "workspace" => Some(Raw::Event(HyprEvent::Workspace, None)),
         "openwindow" => Some(Raw::Event(HyprEvent::OpenWindow, addr(data))),
         "closewindow" => Some(Raw::Event(HyprEvent::CloseWindow, addr(data.trim()))),
-        "activewindowv2" | "movewindowv2" | "fullscreen" | "changefloatingmode" | "monitoraddedv2"
-        | "monitorremovedv2" | "monitoradded" | "monitorremoved" | "configreloaded" => Some(Raw::Refresh),
+        "activewindowv2" | "movewindowv2" | "fullscreen" | "changefloatingmode"
+        | "monitoraddedv2" | "monitorremovedv2" | "monitoradded" | "monitorremoved"
+        | "configreloaded" => Some(Raw::Refresh),
         _ => None,
     }
 }
@@ -231,10 +238,18 @@ impl Parser<'_> {
             b'n' => self.lit("null", J::Null),
             _ => {
                 let start = self.i;
-                while self.b.get(self.i).is_some_and(|c| matches!(c, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')) {
+                while self
+                    .b
+                    .get(self.i)
+                    .is_some_and(|c| matches!(c, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
+                {
                     self.i += 1;
                 }
-                std::str::from_utf8(&self.b[start..self.i]).ok()?.parse().ok().map(J::Num)
+                std::str::from_utf8(&self.b[start..self.i])
+                    .ok()?
+                    .parse()
+                    .ok()
+                    .map(J::Num)
             }
         }
     }
@@ -267,7 +282,9 @@ impl Parser<'_> {
                         b'f' => '\u{c}',
                         b'u' => {
                             let mut cp = self.hex4()?;
-                            if (0xD800..0xDC00).contains(&cp) && self.b[self.i..].starts_with(b"\\u") {
+                            if (0xD800..0xDC00).contains(&cp)
+                                && self.b[self.i..].starts_with(b"\\u")
+                            {
                                 self.i += 2;
                                 let lo = self.hex4()?;
                                 cp = 0x10000 + ((cp - 0xD800) << 10) + lo.wrapping_sub(0xDC00);
@@ -286,7 +303,10 @@ impl Parser<'_> {
 }
 
 pub fn parse_json(text: &str) -> Option<J> {
-    let mut p = Parser { b: text.as_bytes(), i: 0 };
+    let mut p = Parser {
+        b: text.as_bytes(),
+        i: 0,
+    };
     let v = p.value(0)?;
     p.ws();
     (p.i == p.b.len()).then_some(v)
@@ -309,6 +329,9 @@ struct Mon {
     name: String,
     x: i32,
     y: i32,
+    /// Logical size (pixels / scale); 0 if the query did not say.
+    w: i32,
+    h: i32,
 }
 
 /// Where a window is, in logical pixels relative to the top-left corner of
@@ -345,16 +368,31 @@ fn parse_windows(text: &str) -> Option<HashMap<String, Win>> {
     let j = parse_json(text)?;
     let mut out = HashMap::new();
     for w in j.arr()? {
-        if w.get("mapped").and_then(J::bool) == Some(false) || w.get("hidden").and_then(J::bool) == Some(true) {
+        if w.get("mapped").and_then(J::bool) == Some(false)
+            || w.get("hidden").and_then(J::bool) == Some(true)
+        {
             continue;
         }
-        let (Some(addr), Some(x), Some(y), Some(ww), Some(hh)) =
-            (w.get("address").and_then(J::str), px(w, "at", 0), px(w, "at", 1), px(w, "size", 0), px(w, "size", 1))
-        else {
+        let (Some(addr), Some(x), Some(y), Some(ww), Some(hh)) = (
+            w.get("address").and_then(J::str),
+            px(w, "at", 0),
+            px(w, "at", 1),
+            px(w, "size", 0),
+            px(w, "size", 1),
+        ) else {
             continue;
         };
         let monitor = w.get("monitor").and_then(J::num).map_or(-1, |m| m as i64);
-        out.insert(norm_addr(addr), Win { monitor, x, y, w: ww, h: hh });
+        out.insert(
+            norm_addr(addr),
+            Win {
+                monitor,
+                x,
+                y,
+                w: ww,
+                h: hh,
+            },
+        );
     }
     Some(out)
 }
@@ -363,9 +401,31 @@ fn parse_monitors(text: &str) -> Option<HashMap<i64, Mon>> {
     let j = parse_json(text)?;
     let mut out = HashMap::new();
     for m in j.arr()? {
-        let (Some(id), Some(name)) = (m.get("id").and_then(J::num), m.get("name").and_then(J::str)) else { continue };
+        let (Some(id), Some(name)) = (m.get("id").and_then(J::num), m.get("name").and_then(J::str))
+        else {
+            continue;
+        };
         let at = |k: &str| m.get(k).and_then(J::num).map_or(0, |v| v.round() as i32);
-        out.insert(id as i64, Mon { name: name.to_string(), x: at("x"), y: at("y") });
+        let scale = m
+            .get("scale")
+            .and_then(J::num)
+            .filter(|&s| s > 0.0)
+            .unwrap_or(1.0);
+        let size = |k: &str| {
+            m.get(k)
+                .and_then(J::num)
+                .map_or(0, |v| (v / scale).round() as i32)
+        };
+        out.insert(
+            id as i64,
+            Mon {
+                name: name.to_string(),
+                x: at("x"),
+                y: at("y"),
+                w: size("width"),
+                h: size("height"),
+            },
+        );
     }
     Some(out)
 }
@@ -409,7 +469,13 @@ impl Tracker {
     fn place_of(&self, addr: Option<&str>) -> Option<Place> {
         let w = self.windows.get(addr?)?;
         let m = self.monitors.get(&w.monitor)?;
-        Some(Place { monitor: m.name.clone(), x: w.x - m.x, y: w.y - m.y, w: w.w, h: w.h })
+        Some(Place {
+            monitor: m.name.clone(),
+            x: w.x - m.x,
+            y: w.y - m.y,
+            w: w.w,
+            h: w.h,
+        })
     }
 
     /// Feed one line of the event socket. Events that can be answered now go
@@ -425,7 +491,10 @@ impl Tracker {
             Raw::Refresh => self.schedule(now + SETTLE),
             Raw::Event(HyprEvent::Workspace, _) => {
                 self.schedule(now + SETTLE);
-                out.push(Placed { ev: HyprEvent::Workspace, place: None });
+                out.push(Placed {
+                    ev: HyprEvent::Workspace,
+                    place: None,
+                });
             }
             Raw::Event(HyprEvent::OpenWindow, addr) => {
                 self.schedule(now + SETTLE);
@@ -440,9 +509,35 @@ impl Tracker {
                     self.windows.remove(a);
                 }
                 self.schedule(now + SETTLE);
-                out.push(Placed { ev: HyprEvent::CloseWindow, place });
+                out.push(Placed {
+                    ev: HyprEvent::CloseWindow,
+                    place,
+                });
             }
         }
+    }
+
+    /// Ask for a fresh `j/monitors` (and `j/clients`) at the next chance.
+    pub fn want_refresh(&mut self, now: Instant) {
+        if self.refresh_due.is_none() {
+            self.refresh_due = Some(now);
+        }
+    }
+
+    /// Which output a point in the compositor's layout space is on, and where
+    /// on it (logical pixels from its top-left corner).
+    pub fn locate_point(&self, gx: f64, gy: f64) -> Option<(String, i32, i32)> {
+        let (px, py) = (gx.floor() as i32, gy.floor() as i32);
+        self.monitors
+            .values()
+            .find(|m| {
+                m.w > 0 && m.h > 0 && px >= m.x && px < m.x + m.w && py >= m.y && py < m.y + m.h
+            })
+            .map(|m| (m.name.clone(), px - m.x, py - m.y))
+    }
+
+    pub fn has_monitors(&self) -> bool {
+        !self.monitors.is_empty()
     }
 
     /// Time to run `j/clients` and `j/monitors`?
@@ -472,7 +567,10 @@ impl Tracker {
             if self.waiting[i].1 <= now {
                 let (addr, _) = self.waiting.remove(i);
                 let place = self.place_of(addr.as_deref());
-                out.push(Placed { ev: HyprEvent::OpenWindow, place });
+                out.push(Placed {
+                    ev: HyprEvent::OpenWindow,
+                    place,
+                });
             } else {
                 i += 1;
             }
@@ -501,7 +599,10 @@ mod tests {
 
     #[test]
     fn parses_the_events_we_use() {
-        assert_eq!(parse_line("workspace>>3"), Some(Raw::Event(HyprEvent::Workspace, None)));
+        assert_eq!(
+            parse_line("workspace>>3"),
+            Some(Raw::Event(HyprEvent::Workspace, None))
+        );
         assert_eq!(
             parse_line("openwindow>>80A6F50,2,kitty,~"),
             Some(Raw::Event(HyprEvent::OpenWindow, Some("80a6f50".into())))
@@ -536,8 +637,23 @@ mod tests {
         let j = parse_json(CLIENTS).unwrap();
         let title = j.arr().unwrap()[0].get("title").and_then(J::str).unwrap();
         assert_eq!(title, "he said \"{[}\" é 😀 and left");
-        assert_eq!(parse_json("[1, 2.5, -3e2, true, null, \"a\\nb\", {\"k\": []}]").unwrap().arr().unwrap().len(), 7);
-        for bad in ["", "[", "{\"a\":}", "[1,]x", "{\"a\" 1}", "\"unterminated", "[1] 2"] {
+        assert_eq!(
+            parse_json("[1, 2.5, -3e2, true, null, \"a\\nb\", {\"k\": []}]")
+                .unwrap()
+                .arr()
+                .unwrap()
+                .len(),
+            7
+        );
+        for bad in [
+            "",
+            "[",
+            "{\"a\":}",
+            "[1,]x",
+            "{\"a\" 1}",
+            "\"unterminated",
+            "[1] 2",
+        ] {
             assert!(parse_json(bad).is_none(), "{bad:?}");
         }
         let deep = "[".repeat(200) + &"]".repeat(200);
@@ -548,9 +664,54 @@ mod tests {
     fn windows_and_monitors_are_read_from_the_query_output() {
         let w = parse_windows(CLIENTS).unwrap();
         assert_eq!(w.len(), 2, "unmapped and hidden windows are skipped");
-        assert_eq!(w["80a6f50"], Win { monitor: 0, x: 10, y: 20, w: 800, h: 600 });
+        assert_eq!(
+            w["80a6f50"],
+            Win {
+                monitor: 0,
+                x: 10,
+                y: 20,
+                w: 800,
+                h: 600
+            }
+        );
         let m = parse_monitors(MONITORS).unwrap();
-        assert_eq!(m[&1], Mon { name: "DP-2".into(), x: 1920, y: -200 });
+        assert_eq!(
+            m[&1],
+            Mon {
+                name: "DP-2".into(),
+                x: 1920,
+                y: -200,
+                w: 2048,
+                h: 1152
+            }
+        );
+    }
+
+    #[test]
+    fn points_are_mapped_to_an_output_and_local_coordinates() {
+        let mut t = Tracker::new(true, false, Instant::now());
+        t.refresh(None, Some(MONITORS));
+        assert!(t.has_monitors());
+        assert_eq!(t.locate_point(100.0, 50.5), Some(("eDP-1".into(), 100, 50)));
+        assert_eq!(
+            t.locate_point(1920.0 + 10.0, -200.0 + 5.0),
+            Some(("DP-2".into(), 10, 5))
+        );
+        assert_eq!(t.locate_point(1919.9, 5.0), Some(("eDP-1".into(), 1919, 5)));
+        assert_eq!(t.locate_point(5000.0, 5.0), None, "outside every output");
+        assert_eq!(
+            t.locate_point(1920.0 + 2048.0, 0.0),
+            None,
+            "the right edge is exclusive"
+        );
+    }
+
+    #[test]
+    fn cursorpos_parses_and_rejects_garbage() {
+        assert_eq!(parse_cursorpos("1234, 567\n"), Some((1234.0, 567.0)));
+        assert_eq!(parse_cursorpos("-5,10"), Some((-5.0, 10.0)));
+        assert_eq!(parse_cursorpos("nope"), None);
+        assert_eq!(parse_cursorpos("1, x"), None);
     }
 
     fn primed(now: Instant) -> Tracker {
@@ -566,18 +727,32 @@ mod tests {
         let t0 = Instant::now();
         let mut t = primed(t0);
         let mut out = Vec::new();
-        t.on_raw(Raw::Event(HyprEvent::CloseWindow, Some("80b1a00".into())), t0, &mut out);
+        t.on_raw(
+            Raw::Event(HyprEvent::CloseWindow, Some("80b1a00".into())),
+            t0,
+            &mut out,
+        );
         assert_eq!(
             out,
             vec![Placed {
                 ev: HyprEvent::CloseWindow,
                 // layout (2000, 100) on a monitor at (1920, -200)
-                place: Some(Place { monitor: "DP-2".into(), x: 80, y: 300, w: 500, h: 400 }),
+                place: Some(Place {
+                    monitor: "DP-2".into(),
+                    x: 80,
+                    y: 300,
+                    w: 500,
+                    h: 400
+                }),
             }]
         );
         assert_eq!(t.known(), 1, "a closed window is forgotten");
         out.clear();
-        t.on_raw(Raw::Event(HyprEvent::CloseWindow, Some("nosuch".into())), t0, &mut out);
+        t.on_raw(
+            Raw::Event(HyprEvent::CloseWindow, Some("nosuch".into())),
+            t0,
+            &mut out,
+        );
         assert_eq!(out[0].place, None, "unknown window: no place, random spot");
     }
 
@@ -586,19 +761,32 @@ mod tests {
         let t0 = Instant::now();
         let mut t = primed(t0);
         let mut out = Vec::new();
-        t.on_raw(Raw::Event(HyprEvent::OpenWindow, Some("90ffff0".into())), t0, &mut out);
+        t.on_raw(
+            Raw::Event(HyprEvent::OpenWindow, Some("90ffff0".into())),
+            t0,
+            &mut out,
+        );
         assert!(out.is_empty(), "nothing yet");
         t.ready(t0 + Duration::from_millis(50), &mut out);
         assert!(out.is_empty());
         let later = t0 + SETTLE + Duration::from_millis(5);
         assert!(t.refresh_due(later));
         t.ready(later, &mut out);
-        assert!(out.is_empty(), "must not deliver before the refresh has run");
+        assert!(
+            out.is_empty(),
+            "must not deliver before the refresh has run"
+        );
         let fresh = CLIENTS.replace("0x80a6f50", "0x90ffff0");
         t.refresh(Some(&fresh), Some(MONITORS));
         t.ready(later, &mut out);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].place.as_ref().map(|p| (p.monitor.as_str(), p.x, p.y)), Some(("eDP-1", 10, 20)));
+        assert_eq!(
+            out[0]
+                .place
+                .as_ref()
+                .map(|p| (p.monitor.as_str(), p.x, p.y)),
+            Some(("eDP-1", 10, 20))
+        );
     }
 
     #[test]
@@ -618,10 +806,26 @@ mod tests {
         let mut t = Tracker::new(false, true, t0);
         assert!(!t.refresh_due(t0 + Duration::from_secs(9)), "never queries");
         let mut out = Vec::new();
-        t.on_raw(Raw::Event(HyprEvent::OpenWindow, Some("a".into())), t0, &mut out);
+        t.on_raw(
+            Raw::Event(HyprEvent::OpenWindow, Some("a".into())),
+            t0,
+            &mut out,
+        );
         t.on_raw(Raw::Refresh, t0, &mut out);
-        t.on_raw(Raw::Event(HyprEvent::CloseWindow, Some("a".into())), t0, &mut out);
-        assert_eq!(out.iter().map(|p| (p.ev, p.place.is_none())).collect::<Vec<_>>(), vec![(HyprEvent::OpenWindow, true), (HyprEvent::CloseWindow, true)]);
+        t.on_raw(
+            Raw::Event(HyprEvent::CloseWindow, Some("a".into())),
+            t0,
+            &mut out,
+        );
+        assert_eq!(
+            out.iter()
+                .map(|p| (p.ev, p.place.is_none()))
+                .collect::<Vec<_>>(),
+            vec![
+                (HyprEvent::OpenWindow, true),
+                (HyprEvent::CloseWindow, true)
+            ]
+        );
     }
 
     #[test]
@@ -630,7 +834,11 @@ mod tests {
         let mut t = primed(t0);
         let mut out = Vec::new();
         for i in 0..100 {
-            t.on_raw(Raw::Event(HyprEvent::OpenWindow, Some(format!("{i:x}"))), t0, &mut out);
+            t.on_raw(
+                Raw::Event(HyprEvent::OpenWindow, Some(format!("{i:x}"))),
+                t0,
+                &mut out,
+            );
         }
         t.refresh(Some("[]"), Some(MONITORS));
         t.ready(t0 + SETTLE, &mut out);

@@ -9,7 +9,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::config::{ColorMode, Config, Rgb};
+use crate::audio::Light;
+use crate::config::{AgeShading, CellShape, ColorMode, Config, Rgb};
 use crate::controller::{Sim, RAIN_LEVELS};
 use crate::font::Font;
 use crate::look::{rotate_hue, Look};
@@ -75,7 +76,12 @@ pub struct Renderer {
     pal: Vec<Rgb>,
     font: Font,
     fixed: bool,
-    round: bool,
+    shape: CellShape,
+    /// Smooth age gradient (ignored with a fixed colour).
+    smooth: bool,
+    stops: Vec<u8>,
+    /// Hex boards are drawn with odd rows shifted half a cell right.
+    hex_layout: bool,
     colony_cols: Vec<Rgb>,
 }
 
@@ -96,20 +102,34 @@ impl Renderer {
         };
         let mut pal = vec![[0u8; 3]; 22];
         pal[IDX_BG as usize] = p.bg;
-        for (i, c) in [p.newborn, p.mature, p.old, p.ancient].into_iter().enumerate() {
+        for (i, c) in [p.newborn, p.mature, p.old, p.ancient]
+            .into_iter()
+            .enumerate()
+        {
             pal[IDX_AGE0 as usize + i] = c;
         }
         pal[IDX_DYING as usize] = p.dying;
         pal[IDX_FIXED as usize] = live;
         pal[IDX_OVERLAY as usize] = p.overlay;
         for i in 0..TRAIL_STEPS {
-            pal[IDX_TRAIL0 as usize + i] = blend(live, p.bg, 0.5 * (i + 1) as f32 / TRAIL_STEPS as f32);
+            pal[IDX_TRAIL0 as usize + i] =
+                blend(live, p.bg, 0.5 * (i + 1) as f32 / TRAIL_STEPS as f32);
         }
         for i in 0..RAIN_STEPS {
-            pal[IDX_RAIN0 as usize + i] = blend(p.rain, p.bg, 0.5 * (i + 1) as f32 / RAIN_STEPS as f32);
+            pal[IDX_RAIN0 as usize + i] =
+                blend(p.rain, p.bg, 0.5 * (i + 1) as f32 / RAIN_STEPS as f32);
         }
         let colony_cols = cfg.palette.colonies.iter().copied().take(8).collect();
-        Self { pal, font: Font::build(), fixed, round: cfg.cell_round, colony_cols }
+        Self {
+            pal,
+            font: Font::build(),
+            fixed,
+            shape: cfg.cell_shape,
+            smooth: cfg.color_mode == AgeShading::Smooth && !fixed,
+            stops: cfg.color_smooth_stops.clone(),
+            hex_layout: cfg.grid == crate::life::Grid::Hex,
+            colony_cols,
+        }
     }
 
     /// The palette as it should look right now. Background and overlay text
@@ -133,7 +153,14 @@ impl Renderer {
         let col_live = self
             .colony_cols
             .iter()
-            .map(|&c| [adj(blend(c, COLONY_LIGHT, 0.7)), adj(c), adj(blend(c, bg, 0.82)), adj(blend(c, bg, 0.65))])
+            .map(|&c| {
+                [
+                    adj(blend(c, COLONY_LIGHT, 0.7)),
+                    adj(c),
+                    adj(blend(c, bg, 0.82)),
+                    adj(blend(c, bg, 0.65)),
+                ]
+            })
             .collect();
         let col_trail = self
             .colony_cols
@@ -146,7 +173,11 @@ impl Renderer {
                 t
             })
             .collect();
-        Table { pal, col_live, col_trail }
+        Table {
+            pal,
+            col_live,
+            col_trail,
+        }
     }
 
     fn key(&self, idx: u8, glyph: u8) -> Key {
@@ -164,12 +195,33 @@ impl Renderer {
         let ncol = t.col_live.len();
         let use_col = cfg.colonies && !self.fixed && life.colonies_on() && ncol >= 2;
         let key = |idx: u8, glyph: u8| pack(t.pal[idx as usize], glyph);
+        let anchors = age_anchors(self.stops.len());
+        let smooth_on = self.smooth && self.stops.len() >= 2;
+        // Smooth colours: blend the raw palette along the gradient, then apply
+        // hue drift and dimming to the blended value (a table of 8 steps per
+        // stop interval, one group per colony), not just to the palette ends.
+        let lut = if smooth_on {
+            self.smooth_lut(use_col, look)
+        } else {
+            Vec::new()
+        };
 
         for i in 0..out.len() {
             out[i] = match cells[i] {
                 1 => {
                     let class = AGE_STEPS.iter().take_while(|&&s| age[i] >= s).count();
-                    if use_col {
+                    if smooth_on {
+                        let pos = smooth_pos(&anchors, age[i] as f32, sim.heat);
+                        let g = if use_col {
+                            colony[i] as usize % ncol
+                        } else {
+                            0
+                        };
+                        pack(
+                            lut[g][((pos * 8.0).round() as usize).min(lut[g].len() - 1)],
+                            0,
+                        )
+                    } else if use_col {
                         pack(t.col_live[colony[i] as usize % ncol][class], 0)
                     } else if self.fixed {
                         key(IDX_FIXED, 0)
@@ -181,7 +233,10 @@ impl Renderer {
                 _ => {
                     let tr = trail[i] as usize;
                     if tr > 0 {
-                        let step = (tr * TRAIL_STEPS).div_ceil(tl).saturating_sub(1).min(TRAIL_STEPS - 1);
+                        let step = (tr * TRAIL_STEPS)
+                            .div_ceil(tl)
+                            .saturating_sub(1)
+                            .min(TRAIL_STEPS - 1);
                         if use_col {
                             pack(t.col_trail[colony[i] as usize % ncol][step], 0)
                         } else {
@@ -189,7 +244,10 @@ impl Renderer {
                         }
                     } else if let Some(r) = rain.filter(|r| r.level()[i] > 0) {
                         let l = r.level()[i] as usize;
-                        let step = (l * RAIN_STEPS).div_ceil(RAIN_LEVELS as usize).saturating_sub(1).min(RAIN_STEPS - 1);
+                        let step = (l * RAIN_STEPS)
+                            .div_ceil(RAIN_LEVELS as usize)
+                            .saturating_sub(1)
+                            .min(RAIN_STEPS - 1);
                         key(IDX_RAIN0 + step as u8, r.glyph()[i])
                     } else {
                         key(IDX_BG, 0)
@@ -206,7 +264,13 @@ impl Renderer {
         }
 
         if cfg.overlay {
-            let text = format!("gen {} pop {} {} {:.0}hz", sim.gen, life.population(), life.rule().name(), hz);
+            let text = format!(
+                "gen {} pop {} {} {:.0}hz",
+                sim.gen,
+                life.population(),
+                life.rule().name(),
+                hz
+            );
             let row = if rows >= 3 { rows - 2 } else { 0 };
             for (n, c) in text.bytes().enumerate() {
                 let col = 1 + n;
@@ -215,7 +279,136 @@ impl Renderer {
                 }
                 let g = if self.font.has(c) && c != b' ' { c } else { 0 };
                 // A blank overlay cell is a plain bg cell, so the line reads as one block of text.
-                out[row * cols + col] = if g == 0 { self.key(IDX_BG, 0) } else { self.key(IDX_OVERLAY, g) };
+                out[row * cols + col] = if g == 0 {
+                    self.key(IDX_BG, 0)
+                } else {
+                    self.key(IDX_OVERLAY, g)
+                };
+            }
+            if cfg.overlay_sparkline {
+                self.draw_sparkline(sim.sparkline(), out, cols, row);
+            }
+        }
+    }
+
+    /// A bar chart of the last minute above the overlay text: bright = live
+    /// cells, dim = the part of them that has settled. Bars are cells, so it
+    /// scales with the board. Skipped when there is no room.
+    fn draw_sparkline(
+        &self,
+        hist: &std::collections::VecDeque<(usize, usize)>,
+        out: &mut [Key],
+        cols: usize,
+        text_row: usize,
+    ) {
+        const H: usize = 5;
+        if hist.is_empty() || text_row < H + 1 || cols < 4 {
+            return;
+        }
+        let bright = self.key(IDX_OVERLAY, 0);
+        let dim = pack(
+            blend(
+                self.pal[IDX_OVERLAY as usize],
+                self.pal[IDX_BG as usize],
+                0.5,
+            ),
+            0,
+        );
+        let max = hist.iter().map(|&(live, _)| live).max().unwrap_or(1).max(1);
+        let width = hist.len().min(cols - 2);
+        let skip = hist.len() - width; // the newest `width` samples
+        for (n, &(live, settled)) in hist.iter().skip(skip).enumerate() {
+            let bar = (live * H).div_ceil(max).min(H);
+            let low = ((settled.min(live) * H + max / 2) / max).min(bar);
+            for r in 0..bar {
+                let y = text_row - 1 - r;
+                out[y * cols + 1 + n] = if r < low { dim } else { bright };
+            }
+        }
+    }
+
+    /// Gradient colours for every position in 1/8 steps, after hue drift and
+    /// dimming. One row per colony (or a single row without colonies).
+    fn smooth_lut(&self, use_col: bool, look: Look) -> Vec<Vec<Rgb>> {
+        let bg = self.pal[IDX_BG as usize];
+        let adj = |c: Rgb| -> Rgb {
+            let c = rotate_hue(c, look.hue_deg());
+            if look.dim > 0 {
+                blend(c, bg, 1.0 - look.dim_frac())
+            } else {
+                c
+            }
+        };
+        let age_raw = [
+            self.pal[IDX_AGE0 as usize],
+            self.pal[IDX_AGE0 as usize + 1],
+            self.pal[IDX_AGE0 as usize + 2],
+            self.pal[IDX_AGE0 as usize + 3],
+        ];
+        let groups: Vec<[Rgb; 4]> = if use_col {
+            self.colony_cols
+                .iter()
+                .map(|&c| {
+                    [
+                        blend(c, COLONY_LIGHT, 0.7),
+                        c,
+                        blend(c, bg, 0.82),
+                        blend(c, bg, 0.65),
+                    ]
+                })
+                .collect()
+        } else {
+            vec![age_raw]
+        };
+        let steps = (self.stops.len() - 1) * 8 + 1;
+        groups
+            .iter()
+            .map(|raw| {
+                (0..steps)
+                    .map(|k| adj(gradient(raw, &self.stops, k as f32 / 8.0)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The board with the audio light on top: `out` = `display` lifted by
+    /// `l`. Live cells brighten (mid), their halo grows (bass), the background
+    /// tints (treble) and a beat flashes both a little. `dim` is the night /
+    /// battery / idle dimming and is applied last, so light never defeats it.
+    pub fn apply_light(
+        &self,
+        display: &[Key],
+        cells: &[u8],
+        cols: usize,
+        rows: usize,
+        l: Light,
+        dim: f32,
+        out: &mut Vec<Key>,
+    ) {
+        out.clear();
+        out.extend_from_slice(display);
+        if l.is_neutral() || cells.len() != display.len() {
+            return;
+        }
+        let keep = (1.0 - dim).clamp(0.0, 1.0);
+        let bg_key = pack(self.pal[IDX_BG as usize], 0);
+        let tint = self.pal[IDX_AGE0 as usize + 1];
+        if l.glow > 0.0 {
+            self.add_glow(out, cells, cols, rows, l.glow * keep);
+        }
+        let lift = ((l.brighten + l.flash * 0.6) * keep).min(0.8);
+        let pulse = ((l.bg + l.flash * 0.15) * keep).min(0.6);
+        for i in 0..out.len() {
+            let key = out[i];
+            if key_glyph(key) != 0 {
+                continue;
+            }
+            if cells[i] == 1 {
+                if lift > 0.0 {
+                    out[i] = pack(blend([255, 255, 255], key_rgb(key), lift), 0);
+                }
+            } else if pulse > 0.0 && display[i] == bg_key {
+                out[i] = pack(blend(tint, key_rgb(key), pulse), 0);
             }
         }
     }
@@ -273,7 +466,11 @@ impl Renderer {
             if cells[i] == 1 || w < 0.004 || key_glyph(out[i]) != 0 {
                 continue;
             }
-            let avg = [(ch[1][i] / w).round() as u8, (ch[2][i] / w).round() as u8, (ch[3][i] / w).round() as u8];
+            let avg = [
+                (ch[1][i] / w).round() as u8,
+                (ch[2][i] / w).round() as u8,
+                (ch[3][i] / w).round() as u8,
+            ];
             let s = (amount * GLOW_GAIN * w).min(GLOW_CAP);
             out[i] = pack(blend(avg, key_rgb(out[i]), s), 0);
         }
@@ -285,25 +482,53 @@ impl Renderer {
         let b = self.pal[IDX_BG as usize];
         let bg = [b[2], b[1], b[0], 0xFF];
         let glyph = key_glyph(key);
-        let (x0, y0) = (cx * t.cell, cy * t.cell);
+        let shift = if self.hex_layout && cy % 2 == 1 {
+            t.cell / 2
+        } else {
+            0
+        };
+        let (x0, y0) = (cx * t.cell + shift, cy * t.cell);
         let (x1, y1) = ((x0 + t.cell).min(t.w), (y0 + t.cell).min(t.h));
         let stride = t.w * 4;
         // Glyph cells (rain, overlay text) keep the full cell so text stays
         // legible; plain cells are an inset (optionally rounded) square.
-        let gap = if glyph == 0 { t.gap.min(t.cell.saturating_sub(1)) } else { 0 };
+        let gap = if glyph == 0 {
+            t.gap.min(t.cell.saturating_sub(1))
+        } else {
+            0
+        };
         let side = t.cell - gap;
         let lead = gap / 2; // gap is split between the leading and trailing edge
-        // ~0.4 of the side: at 7-8px that trims the corner pixels, on big cells it is a real curve
-        let radius = if self.round && glyph == 0 { ((side as f32 * 0.4).ceil() as usize).clamp(1, (side / 2).max(1)) } else { 0 };
+                            // ~0.4 of the side: at 7-8px that trims the corner pixels, on big cells it is a real curve
+        let radius = if self.shape == CellShape::Rounded && glyph == 0 {
+            ((side as f32 * 0.4).ceil() as usize).clamp(1, (side / 2).max(1))
+        } else {
+            0
+        };
         for y in y0..y1 {
             let row = &mut t.canvas[y * stride..(y + 1) * stride];
             for x in x0..x1 {
                 let on = if glyph != 0 {
                     self.font.pixel(glyph, x - x0, y - y0, t.cell)
                 } else {
-                    in_square(x - x0, y - y0, lead, side, radius)
+                    in_shape(self.shape, x - x0, y - y0, lead, side, radius)
                 };
                 row[x * 4..x * 4 + 4].copy_from_slice(if on { &color } else { &bg });
+            }
+            if shift > 0 && cx == 0 {
+                // the strip the shifted row leaves free at its left edge
+                for x in 0..shift.min(t.w) {
+                    row[x * 4..x * 4 + 4].copy_from_slice(&bg);
+                }
+            }
+        }
+    }
+
+    /// Paint every cell of `display` (headless rendering, `--once`).
+    pub fn paint_all(&self, t: &mut Target, display: &[Key]) {
+        for cy in 0..t.rows {
+            for cx in 0..t.cols {
+                self.draw_cell(t, cx, cy, display[cy * t.cols + cx]);
             }
         }
     }
@@ -338,7 +563,8 @@ impl Renderer {
             if lo != usize::MAX {
                 let x = lo * t.cell;
                 let y = cy * t.cell;
-                let w = ((hi + 1) * t.cell).min(t.w).saturating_sub(x);
+                let slack = if self.hex_layout { t.cell / 2 } else { 0 };
+                let w = ((hi + 1) * t.cell + slack).min(t.w).saturating_sub(x);
                 let h = ((cy + 1) * t.cell).min(t.h).saturating_sub(y);
                 damage.push([x as i32, y as i32, w as i32, h as i32]);
             }
@@ -389,6 +615,65 @@ fn blur5(p: &mut [f32], tmp: &mut [f32], cols: usize, rows: usize) {
     }
 }
 
+/// Like `in_square`, for every `cell_shape`. A circle or hexagon is inscribed
+/// in the `side` square (the hexagon has pointy top and bottom).
+fn in_shape(shape: CellShape, x: usize, y: usize, lead: usize, side: usize, radius: usize) -> bool {
+    match shape {
+        CellShape::Square | CellShape::Rounded => in_square(x, y, lead, side, radius),
+        CellShape::Circle | CellShape::Hex => {
+            if x < lead || y < lead || x >= lead + side || y >= lead + side {
+                return false;
+            }
+            let r = side as f32 / 2.0;
+            let dx = ((x - lead) as f32 + 0.5 - r).abs();
+            let dy = ((y - lead) as f32 + 0.5 - r).abs();
+            if shape == CellShape::Circle {
+                dx * dx + dy * dy <= r * r
+            } else {
+                dx <= r * 0.866 && dx * 0.5 + dy * 0.866 <= r * 0.866
+            }
+        }
+    }
+}
+
+/// Ages at which each stop of the smooth gradient sits. With four stops they
+/// are the class boundaries of the stepped look.
+fn age_anchors(n: usize) -> Vec<f32> {
+    match n {
+        0 | 1 => vec![0.0, 60.0],
+        2 => vec![0.0, 60.0],
+        3 => vec![0.0, 8.0, 60.0],
+        4 => vec![0.0, 3.0, 12.0, 60.0],
+        _ => (0..n).map(|i| 60.0 * i as f32 / (n - 1) as f32).collect(),
+    }
+}
+
+/// Position along the gradient (0 = first stop, n-1 = last) for a cell of
+/// `age`, pushed along by `heat` and rounded to 1/8 so colours do not
+/// change on every single generation.
+fn smooth_pos(anchors: &[f32], age: f32, heat: u8) -> f32 {
+    let last = anchors.len() - 1;
+    let mut pos = last as f32;
+    for k in 0..last {
+        if age < anchors[k + 1] {
+            pos = k as f32 + (age - anchors[k]).max(0.0) / (anchors[k + 1] - anchors[k]);
+            break;
+        }
+    }
+    ((pos + heat as f32).min(last as f32) * 8.0).round() / 8.0
+}
+
+fn gradient(arr: &[Rgb; 4], stops: &[u8], pos: f32) -> Rgb {
+    let last = stops.len() - 1;
+    let lo = (pos.floor() as usize).min(last);
+    let hi = (lo + 1).min(last);
+    blend(
+        arr[stops[hi] as usize & 3],
+        arr[stops[lo] as usize & 3],
+        pos - lo as f32,
+    )
+}
+
 /// True if pixel (x, y) of a cell lies inside the `side`-wide square that
 /// starts `lead` pixels in from the cell's top-left corner, with corners
 /// rounded to `radius` (0 = sharp).
@@ -402,8 +687,20 @@ fn in_square(x: usize, y: usize, lead: usize, side: usize, radius: usize) -> boo
     let (lx, ly) = ((x - lead) as f32 + 0.5, (y - lead) as f32 + 0.5);
     let (s, r) = (side as f32, radius as f32);
     // distance past the corner-circle centre, per axis (0 inside the straight part)
-    let dx = if lx < r { r - lx } else if lx > s - r { lx - (s - r) } else { 0.0 };
-    let dy = if ly < r { r - ly } else if ly > s - r { ly - (s - r) } else { 0.0 };
+    let dx = if lx < r {
+        r - lx
+    } else if lx > s - r {
+        lx - (s - r)
+    } else {
+        0.0
+    };
+    let dy = if ly < r {
+        r - ly
+    } else if ly > s - r {
+        ly - (s - r)
+    } else {
+        0.0
+    };
     dx * dx + dy * dy <= r * r
 }
 
@@ -422,7 +719,14 @@ pub struct Fade {
 
 impl Fade {
     pub fn new(n: usize, now: Instant) -> Self {
-        Self { from: vec![0; n], to: vec![0; n], changing: Vec::new(), start: now, dur: Duration::ZERO, active: false }
+        Self {
+            from: vec![0; n],
+            to: vec![0; n],
+            changing: Vec::new(),
+            start: now,
+            dur: Duration::ZERO,
+            active: false,
+        }
     }
 
     pub fn target_mut(&mut self) -> &mut [Key] {
@@ -464,11 +768,16 @@ impl Fade {
         if !self.active {
             return false;
         }
-        let x = now.saturating_duration_since(self.start).as_secs_f32() / self.dur.as_secs_f32().max(1e-3);
+        let x = now.saturating_duration_since(self.start).as_secs_f32()
+            / self.dur.as_secs_f32().max(1e-3);
         let t = x.clamp(0.0, 1.0);
         let e = t * t * (3.0 - 2.0 * t); // smoothstep
         for &i in &self.changing {
-            display[i] = if t >= 1.0 { self.to[i] } else { blend_keys(self.from[i], self.to[i], e) };
+            display[i] = if t >= 1.0 {
+                self.to[i]
+            } else {
+                blend_keys(self.from[i], self.to[i], e)
+            };
         }
         if t >= 1.0 {
             self.active = false;
@@ -499,6 +808,17 @@ pub fn grid_dims(w: usize, h: usize, cell: usize) -> (usize, usize) {
     (w.div_ceil(cell).max(1), h.div_ceil(cell).max(1))
 }
 
+/// Like `grid_dims`, for a topology: a hex board needs an even number of rows,
+/// so the wrap-around keeps the offset pattern going.
+pub fn grid_dims_for(grid: crate::life::Grid, w: usize, h: usize, cell: usize) -> (usize, usize) {
+    let (cols, rows) = grid_dims(w, h, cell);
+    if grid == crate::life::Grid::Hex && rows % 2 == 1 {
+        (cols, rows + 1)
+    } else {
+        (cols, rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,17 +836,41 @@ mod tests {
         let mut display = vec![r.key(IDX_BG, 0); cols * rows];
         let mut dmg = Vec::new();
 
-        let mut t = Target { canvas: &mut canvas, w, h, cell, gap: 0, cols, rows };
+        let mut t = Target {
+            canvas: &mut canvas,
+            w,
+            h,
+            cell,
+            gap: 0,
+            cols,
+            rows,
+        };
         r.draw(&mut t, &display, &mut shown, &mut presented, &mut dmg);
         assert_eq!(dmg.len(), rows); // first frame: every row damaged
 
         display[cols + 1] = r.key(IDX_AGE0, 0);
-        let mut t = Target { canvas: &mut canvas, w, h, cell, gap: 0, cols, rows };
+        let mut t = Target {
+            canvas: &mut canvas,
+            w,
+            h,
+            cell,
+            gap: 0,
+            cols,
+            rows,
+        };
         r.draw(&mut t, &display, &mut shown, &mut presented, &mut dmg);
         assert_eq!(dmg, vec![[8, 8, 8, 8]]);
 
         // Nothing changed: nothing damaged.
-        let mut t = Target { canvas: &mut canvas, w, h, cell, gap: 0, cols, rows };
+        let mut t = Target {
+            canvas: &mut canvas,
+            w,
+            h,
+            cell,
+            gap: 0,
+            cols,
+            rows,
+        };
         r.draw(&mut t, &display, &mut shown, &mut presented, &mut dmg);
         assert!(dmg.is_empty());
     }
@@ -541,10 +885,26 @@ mod tests {
         let (w, h, cell) = (16usize, 8usize, 8usize);
         let live = [200u8, 100, 50];
         let draw = |gap: usize, round: bool| {
-            let cfg = Config { cell_round: round, color: ColorMode::Fixed(live), ..Config::default() };
+            let cfg = Config {
+                cell_shape: if round {
+                    CellShape::Rounded
+                } else {
+                    CellShape::Square
+                },
+                color: ColorMode::Fixed(live),
+                ..Config::default()
+            };
             let r = Renderer::new(&cfg);
             let mut canvas = vec![0u8; w * h * 4];
-            let mut t = Target { canvas: &mut canvas, w, h, cell, gap, cols: 2, rows: 1 };
+            let mut t = Target {
+                canvas: &mut canvas,
+                w,
+                h,
+                cell,
+                gap,
+                cols: 2,
+                rows: 1,
+            };
             r.draw_cell(&mut t, 0, 0, r.key(IDX_FIXED, 0));
             (canvas, r.pal[IDX_BG as usize])
         };
@@ -570,19 +930,295 @@ mod tests {
     }
 
     #[test]
+    fn circle_and_hex_cells_are_inscribed_shapes() {
+        let (w, h, cell) = (16usize, 8usize, 8usize);
+        let live = [200u8, 100, 50];
+        let draw = |shape: CellShape| {
+            let cfg = Config {
+                cell_shape: shape,
+                cell_gap: 0,
+                color: ColorMode::Fixed(live),
+                ..Config::default()
+            };
+            let r = Renderer::new(&cfg);
+            let mut canvas = vec![0u8; w * h * 4];
+            let mut t = Target {
+                canvas: &mut canvas,
+                w,
+                h,
+                cell,
+                gap: 0,
+                cols: 2,
+                rows: 1,
+            };
+            r.draw_cell(&mut t, 0, 0, r.key(IDX_FIXED, 0));
+            (canvas, r.pal[IDX_BG as usize])
+        };
+        let (c, bg) = draw(CellShape::Circle);
+        assert_eq!(pixel(&c, w, 0, 0), bg, "corner is outside the circle");
+        assert_eq!(pixel(&c, w, 7, 7), bg);
+        assert_eq!(pixel(&c, w, 3, 3), live);
+        assert_eq!(pixel(&c, w, 4, 4), live);
+        assert_eq!(pixel(&c, w, 3, 0), live, "edge middle is inside");
+        let (c, bg) = draw(CellShape::Hex);
+        assert_eq!(pixel(&c, w, 0, 0), bg);
+        assert_eq!(
+            pixel(&c, w, 0, 3),
+            bg,
+            "pointy top and bottom, flat sides: side middle is inside only if wide enough"
+        );
+        assert_eq!(pixel(&c, w, 3, 3), live);
+        assert_eq!(pixel(&c, w, 3, 0), live, "the point at the top");
+        let (c, _) = draw(CellShape::Square);
+        assert_eq!(pixel(&c, w, 0, 0), live);
+        // a one-pixel cell never vanishes
+        assert!(
+            in_shape(CellShape::Circle, 0, 0, 0, 1, 0) && in_shape(CellShape::Hex, 0, 0, 0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn smooth_gradient_runs_through_the_stops_and_steps_stay_as_they_were() {
+        let a = age_anchors(4);
+        assert_eq!(a, vec![0.0, 3.0, 12.0, 60.0]);
+        assert_eq!(smooth_pos(&a, 0.0, 0), 0.0);
+        assert_eq!(smooth_pos(&a, 3.0, 0), 1.0);
+        assert_eq!(smooth_pos(&a, 12.0, 0), 2.0);
+        assert_eq!(smooth_pos(&a, 200.0, 0), 3.0);
+        let mid = smooth_pos(&a, 7.5, 0);
+        assert!(mid > 1.0 && mid < 2.0);
+        assert_eq!(
+            smooth_pos(&a, 60.0, 5),
+            3.0,
+            "heat cannot push past the last stop"
+        );
+        let arr = [
+            [0u8, 0, 0],
+            [100, 100, 100],
+            [200, 200, 200],
+            [250, 250, 250],
+        ];
+        assert_eq!(gradient(&arr, &[0, 1, 2, 3], 1.0), [100, 100, 100]);
+        assert_eq!(gradient(&arr, &[0, 1, 2, 3], 1.5), [150, 150, 150]);
+        assert_eq!(
+            gradient(&arr, &[0, 3], 0.5),
+            [125, 125, 125],
+            "two stops: first and last colour only"
+        );
+        assert_eq!(gradient(&arr, &[0, 3], 1.0), [250, 250, 250]);
+
+        // end to end: young cells differ from old ones, and the default look is the old one
+        let base = Config {
+            colonies: false,
+            vignette: 0.0,
+            glow: 0.0,
+            trail: false,
+            ..Config::default()
+        };
+        let smooth = Config {
+            color_mode: AgeShading::Smooth,
+            ..base.clone()
+        };
+        let mut sim = Sim::new(8, 4, std::time::Instant::now(), &base);
+        sim.life.clear();
+        let (cols, rows) = (sim.life.cols(), sim.life.rows());
+        sim.life.set_alive(cols + 1);
+        sim.life.set_alive(cols + 2);
+        let compose = |cfg: &Config| {
+            let mut out = vec![0; cols * rows];
+            Renderer::new(cfg).compose(&sim, cfg, 4.0, Look::default(), &mut out);
+            out
+        };
+        let steps = compose(&base);
+        let sm = compose(&smooth);
+        let i = cols + 1;
+        assert_eq!(
+            key_rgb(steps[i]),
+            base.palette.newborn,
+            "age 0 is the first stop either way"
+        );
+        assert_eq!(steps[i], sm[i]);
+        assert_eq!(steps[0], sm[0], "background identical");
+    }
+
+    #[test]
+    fn audio_light_lifts_live_cells_tints_the_background_and_respects_dim() {
+        let cfg = Config {
+            colonies: false,
+            vignette: 0.0,
+            glow: 0.0,
+            trail: false,
+            ..Config::default()
+        };
+        let r = Renderer::new(&cfg);
+        let (cols, rows) = (6usize, 4usize);
+        let bg = r.key(IDX_BG, 0);
+        let mut display = vec![bg; cols * rows];
+        let mut cells = vec![0u8; cols * rows];
+        let live = r.key(IDX_AGE0 + 1, 0);
+        display[8] = live;
+        cells[8] = 1;
+        let mut out = Vec::new();
+        r.apply_light(
+            &display,
+            &cells,
+            cols,
+            rows,
+            Light::default(),
+            0.0,
+            &mut out,
+        );
+        assert_eq!(out, display, "neutral light changes nothing");
+        let l = Light {
+            brighten: 0.5,
+            glow: 0.0,
+            bg: 0.25,
+            flash: 0.0,
+        };
+        r.apply_light(&display, &cells, cols, rows, l, 0.0, &mut out);
+        let sum = |k: Key| key_rgb(k).iter().map(|&c| c as u32).sum::<u32>();
+        assert!(sum(out[8]) > sum(live), "live cell brightened");
+        assert!(sum(out[0]) > sum(bg), "background tinted");
+        r.apply_light(&display, &cells, cols, rows, l, 0.9, &mut out);
+        let dimmed = sum(out[8]);
+        r.apply_light(&display, &cells, cols, rows, l, 0.0, &mut out);
+        assert!(dimmed < sum(out[8]), "dim shrinks the light");
+        let g = Light {
+            glow: 0.5,
+            ..Light::default()
+        };
+        r.apply_light(&display, &cells, cols, rows, g, 0.0, &mut out);
+        assert_ne!(out[9], bg, "halo reaches the neighbour");
+    }
+
+    #[test]
+    fn hex_boards_get_an_even_row_count_and_shifted_odd_rows() {
+        use crate::life::Grid;
+        assert_eq!(grid_dims_for(Grid::Square, 100, 70, 10), (10, 7));
+        assert_eq!(grid_dims_for(Grid::Hex, 100, 70, 10), (10, 8));
+        assert_eq!(grid_dims_for(Grid::Hex, 100, 80, 10), (10, 8));
+        let (w, h, cell) = (40usize, 20usize, 10usize);
+        let cfg = Config {
+            grid: Grid::Hex,
+            cell_shape: CellShape::Square,
+            cell_gap: 0,
+            color: ColorMode::Fixed([200, 100, 50]),
+            ..Config::default()
+        };
+        let r = Renderer::new(&cfg);
+        let mut canvas = vec![0u8; w * h * 4];
+        let mut t = Target {
+            canvas: &mut canvas,
+            w,
+            h,
+            cell,
+            gap: 0,
+            cols: 4,
+            rows: 2,
+        };
+        r.draw_cell(&mut t, 0, 1, r.key(IDX_FIXED, 0)); // odd row: shifted right by half a cell
+        let bg = r.pal[IDX_BG as usize];
+        assert_eq!(
+            pixel(&canvas, w, 2, 12),
+            bg,
+            "the strip left of the shifted cell is background"
+        );
+        assert_eq!(pixel(&canvas, w, 6, 12), [200, 100, 50]);
+        assert_eq!(pixel(&canvas, w, 14, 12), [200, 100, 50]);
+        assert_ne!(
+            pixel(&canvas, w, 16, 12),
+            [200, 100, 50],
+            "past the shifted cell"
+        );
+    }
+
+    #[test]
+    fn the_sparkline_draws_bars_from_history_and_needs_room() {
+        use std::collections::VecDeque;
+        let cfg = Config::default();
+        let r = Renderer::new(&cfg);
+        let (cols, rows) = (20usize, 12usize);
+        let mut out = vec![r.key(IDX_BG, 0); cols * rows];
+        let hist: VecDeque<(usize, usize)> = [(10, 0), (20, 10), (20, 20)].into_iter().collect();
+        r.draw_sparkline(&hist, &mut out, cols, rows - 2);
+        let bright = r.key(IDX_OVERLAY, 0);
+        let bg = r.key(IDX_BG, 0);
+        assert_eq!(
+            out[(rows - 3) * cols + 1],
+            bright,
+            "bottom of the first bar"
+        );
+        assert_eq!(
+            out[(rows - 5) * cols + 1],
+            bright,
+            "10 of 20 on a five-row chart rounds up to three rows"
+        );
+        assert_eq!(out[(rows - 6) * cols + 1], bg, "and no more");
+        let full: Vec<Key> = (0..5).map(|k| out[(rows - 3 - k) * cols + 3]).collect();
+        assert!(
+            full.iter().all(|&k| k != bg),
+            "tallest bar fills all five rows"
+        );
+        assert_ne!(
+            out[(rows - 3) * cols + 2],
+            bright,
+            "settled part of the second bar is dimmer"
+        );
+        let before = out.clone();
+        r.draw_sparkline(&hist, &mut out, cols, 3);
+        assert_eq!(out, before, "too little room above the text: nothing drawn");
+    }
+
+    #[test]
+    fn hue_drift_acts_on_the_blended_value_in_smooth_mode() {
+        let base = Config {
+            color_mode: AgeShading::Smooth,
+            colonies: false,
+            ..Config::default()
+        };
+        let r = Renderer::new(&base);
+        let plain = r.smooth_lut(false, Look::default());
+        let drifted = r.smooth_lut(false, Look { hue: 120, dim: 0 });
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].len(), 3 * 8 + 1);
+        assert_ne!(
+            plain[0][12], drifted[0][12],
+            "a mid-gradient colour moved with the hue"
+        );
+        let dimmed = r.smooth_lut(false, Look { hue: 0, dim: 16 });
+        let lum = |c: Rgb| c.iter().map(|&x| x as u32).sum::<u32>();
+        assert!(lum(dimmed[0][20]) < lum(plain[0][20]));
+    }
+
+    #[test]
     fn compose_produces_age_colors_and_overlay() {
-        let cfg = Config { overlay: true, colonies: false, vignette: 0.0, glow: 0.0, ..Config::default() };
+        let cfg = Config {
+            overlay: true,
+            colonies: false,
+            vignette: 0.0,
+            glow: 0.0,
+            ..Config::default()
+        };
         let r = Renderer::new(&cfg);
         let sim = Sim::new(60, 10, Instant::now(), &cfg);
         let mut out = vec![0; 600];
         r.compose(&sim, &cfg, 4.0, Look::default(), &mut out);
         let newborn = pack(cfg.palette.newborn, 0);
         assert!(out.iter().any(|&k| k == newborn)); // newborn soup
-        assert!(out.iter().any(|&k| key_glyph(k) != 0 && key_rgb(k) == cfg.palette.overlay));
+        assert!(out
+            .iter()
+            .any(|&k| key_glyph(k) != 0 && key_rgb(k) == cfg.palette.overlay));
     }
 
     fn plain_cfg() -> Config {
-        Config { colonies: false, vignette: 0.0, glow: 0.0, trail: false, overlay: false, ..Config::default() }
+        Config {
+            colonies: false,
+            vignette: 0.0,
+            glow: 0.0,
+            trail: false,
+            overlay: false,
+            ..Config::default()
+        }
     }
 
     fn one_cell_sim(cols: usize, rows: usize, at: (usize, usize), cfg: &Config) -> Sim {
@@ -594,7 +1230,10 @@ mod tests {
 
     #[test]
     fn glow_tints_neighbours_but_not_far_cells_or_live_ones() {
-        let cfg = Config { glow: 0.5, ..plain_cfg() };
+        let cfg = Config {
+            glow: 0.5,
+            ..plain_cfg()
+        };
         let r = Renderer::new(&cfg);
         let (cols, rows) = (21, 11);
         let sim = one_cell_sim(cols, rows, (10, 5), &cfg);
@@ -604,7 +1243,10 @@ mod tests {
         let at = |x: usize, y: usize| out[y * cols + x];
         assert_ne!(at(11, 5), bg, "next to the live cell");
         assert_ne!(at(12, 5), bg, "two cells away still glows a little");
-        assert!(key_rgb(at(11, 5))[0] > key_rgb(at(12, 5))[0].min(key_rgb(at(11, 5))[0]) || at(11, 5) != at(12, 5));
+        assert!(
+            key_rgb(at(11, 5))[0] > key_rgb(at(12, 5))[0].min(key_rgb(at(11, 5))[0])
+                || at(11, 5) != at(12, 5)
+        );
         assert_eq!(at(15, 5), bg, "far away stays background");
         assert_eq!(at(0, 0), bg);
         let live = pack(cfg.palette.newborn, 0);
@@ -613,7 +1255,10 @@ mod tests {
         let halo = key_rgb(at(11, 5));
         assert!(halo[0] < key_rgb(live)[0] && halo[1] < key_rgb(live)[1]);
 
-        let off = Config { glow: 0.0, ..plain_cfg() };
+        let off = Config {
+            glow: 0.0,
+            ..plain_cfg()
+        };
         let mut out2 = vec![0; cols * rows];
         Renderer::new(&off).compose(&sim, &off, 4.0, Look::default(), &mut out2);
         assert_eq!(out2[5 * cols + 11], bg);
@@ -621,7 +1266,10 @@ mod tests {
 
     #[test]
     fn vignette_dims_corners_but_not_the_centre_or_background() {
-        let cfg = Config { vignette: 0.5, ..plain_cfg() };
+        let cfg = Config {
+            vignette: 0.5,
+            ..plain_cfg()
+        };
         let r = Renderer::new(&cfg);
         let (cols, rows) = (40, 20);
         let mut sim = Sim::new(cols, rows, Instant::now(), &cfg);
@@ -635,13 +1283,19 @@ mod tests {
         assert_eq!(out[10 * cols + 20], full);
         let corner = key_rgb(out[0]);
         let bg = cfg.palette.bg;
-        assert!(corner[0] < key_rgb(full)[0] && corner[0] >= bg[0], "corner is dimmed towards bg: {corner:?}");
+        assert!(
+            corner[0] < key_rgb(full)[0] && corner[0] >= bg[0],
+            "corner is dimmed towards bg: {corner:?}"
+        );
         assert_eq!(out[5 * cols + 5], pack(bg, 0));
     }
 
     #[test]
     fn colonies_draw_in_colony_colours_with_age_shading() {
-        let cfg = Config { colonies: true, ..plain_cfg() };
+        let cfg = Config {
+            colonies: true,
+            ..plain_cfg()
+        };
         let r = Renderer::new(&cfg);
         let (cols, rows) = (8, 4);
         let mut sim = Sim::new(cols, rows, Instant::now(), &cfg);
@@ -655,11 +1309,20 @@ mod tests {
         assert_ne!(out[0], out[1], "different colonies, different colours");
         let c1 = key_rgb(out[0]);
         let base = cfg.palette.colonies[1];
-        assert!(c1[0] >= base[0] || c1[1] >= base[1], "newborn is the lightened colony colour");
-        let off = Config { colonies: false, ..plain_cfg() };
+        assert!(
+            c1[0] >= base[0] || c1[1] >= base[1],
+            "newborn is the lightened colony colour"
+        );
+        let off = Config {
+            colonies: false,
+            ..plain_cfg()
+        };
         let mut out2 = vec![0; cols * rows];
         Renderer::new(&off).compose(&sim, &off, 4.0, Look::default(), &mut out2);
-        assert_eq!(out2[0], out2[1], "without colonies both are plain newborn colour");
+        assert_eq!(
+            out2[0], out2[1],
+            "without colonies both are plain newborn colour"
+        );
     }
 
     #[test]
@@ -675,7 +1338,10 @@ mod tests {
         assert_eq!(a[0], b[0], "background is not tinted");
         let dimmed = key_rgb(b[2 * 9 + 4]);
         let rotated = rotate_hue(cfg.palette.newborn, 40.0);
-        assert!(dimmed[0] < rotated[0] || dimmed[1] < rotated[1], "night dimming darkens");
+        assert!(
+            dimmed[0] < rotated[0] || dimmed[1] < rotated[1],
+            "night dimming darkens"
+        );
     }
 
     #[test]
@@ -724,7 +1390,11 @@ mod tests {
     #[test]
     fn fade_restarts_from_what_is_shown_and_smooth_off_snaps() {
         let t0 = Instant::now();
-        let (a, b, c) = (pack([0, 0, 0], 0), pack([100, 100, 100], 0), pack([200, 200, 200], 0));
+        let (a, b, c) = (
+            pack([0, 0, 0], 0),
+            pack([100, 100, 100], 0),
+            pack([200, 200, 200], 0),
+        );
         let mut display = vec![a];
         let mut f = Fade::new(1, t0);
         f.target_mut()[0] = b;
@@ -732,7 +1402,12 @@ mod tests {
         f.step(t0 + Duration::from_millis(50), &mut display);
         let shown = display[0];
         f.target_mut()[0] = c;
-        f.begin(&mut display, t0 + Duration::from_millis(50), Duration::from_millis(100), true);
+        f.begin(
+            &mut display,
+            t0 + Duration::from_millis(50),
+            Duration::from_millis(100),
+            true,
+        );
         assert_eq!(display[0], shown); // no jump when a new generation lands mid-fade
         f.begin(&mut display, t0, Duration::from_millis(100), false);
         assert_eq!(display[0], c);
@@ -746,7 +1421,10 @@ mod tests {
     fn dump_frame() {
         use std::{io::Write, time::Duration};
         let path = std::env::var("LW_PPM").unwrap_or_else(|_| "/tmp/frame.ppm".into());
-        let mut cfg = Config { fps: 8.0, ..Config::default() };
+        let mut cfg = Config {
+            fps: 8.0,
+            ..Config::default()
+        };
         if std::env::var("LW_NOGLOW").is_ok() {
             cfg.glow = 0.0;
             cfg.vignette = 0.0;
@@ -767,7 +1445,15 @@ mod tests {
         let mut shown = vec![SENTINEL; cols * rows];
         let mut presented = vec![SENTINEL; cols * rows];
         let mut dmg = Vec::new();
-        let mut t = Target { canvas: &mut canvas, w, h, cell, gap: cfg.cell_gap, cols, rows };
+        let mut t = Target {
+            canvas: &mut canvas,
+            w,
+            h,
+            cell,
+            gap: cfg.cell_gap,
+            cols,
+            rows,
+        };
         r.draw(&mut t, &keys, &mut shown, &mut presented, &mut dmg);
         let mut f = std::fs::File::create(path).unwrap();
         write!(f, "P6\n{w} {h}\n255\n").unwrap();

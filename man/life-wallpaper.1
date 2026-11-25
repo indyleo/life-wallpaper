@@ -21,6 +21,27 @@ Render only on the named output. By default, all outputs are used.
 .B --list-outputs
 Print detected output names, make/model, logical size, and scale, then exit.
 .TP
+.B --version
+Print the version and exit.
+.TP
+.B --dump-config
+Print the resolved configuration (defaults, preset, file and flags merged) and exit.
+.TP
+.BI --validate-config " PATH"
+Parse a config file and exit non-zero on error.
+.TP
+.BR --once " (with " "--output FILE.png" ", " --once-size " WxH, " --once-gens " N)"
+Render one frame headless to a PNG and exit.
+.TP
+.BI --inject " NAME " "[--at X Y] [--edge E]"
+Place a pattern at start-up (or at the end of --once). \fBtext=WORDS\fR spells text.
+.TP
+.BR --load-scene " NAME, " --save-scene " NAME"
+Named boards in \fBscenes_dir\fR; --save-scene saves on exit.
+.TP
+.BR --stats ", " --verbose
+Status line per second / extra diagnostics on stderr.
+.TP
 .BI --config " PATH"
 Read configuration from PATH. If omitted, the default is
 .I $XDG_CONFIG_HOME/life-wallpaper/config.toml
@@ -206,8 +227,60 @@ Ask Hyprland where a window is, so a closed window blooms where it was and a new
 Every so many seconds a stamp spells the local time as HH:MM (0 = off; requires stamps).
 .TP
 .BR audio ", " audio_sensitivity ", " audio_command
-Gliders on beats, from a helper process (default: pw-cat on the default output's monitor) writing raw mono
-16-bit samples at 11025 Hz to stdout. Off by default; read at start-up.
+React to what is playing, from a helper process (default: pw-cat on the default output's monitor, with
+parec and pacat as fallbacks) writing raw mono 16-bit samples at 11025 Hz to stdout. Off by default; read at
+start-up. The helper is restarted with backoff if it exits (\fBaudio_restart_backoff\fR,
+\fBaudio_restart_max_secs\fR) and stopped while every output is hidden.
+.TP
+.BR audio_gliders ", " audio_react
+With audio on, beats send gliders (\fBaudio_gliders\fR) and/or the board lights up with the music
+(\fBaudio_react\fR, no cells added). Tune the light with \fBaudio_gain\fR, \fBaudio_brighten\fR,
+\fBaudio_glow\fR, \fBaudio_bg\fR, \fBaudio_flash\fR, \fBaudio_flash_ms\fR, \fBaudio_attack_ms\fR,
+\fBaudio_release_ms\fR, \fBaudio_floor\fR. Bass drives glow and flash, mid the brightness, treble the background.
+.TP
+.BR audio_band_bass_sensitivity ", " audio_band_mid_sensitivity ", " audio_band_treble_sensitivity
+Beat sensitivity of one band (a number, or master to follow audio_sensitivity).
+\fBaudio_band_bass_gliders\fR, \fBaudio_band_mid_sparks\fR and \fBaudio_band_treble_noise\fR
+route a band's beats to gliders, sparks or cosmic rays.
+.TP
+.B cell_shape
+square, circle, hex or rounded (default). \fBcell_round\fR is the old alias (true = rounded, false = square).
+.TP
+.BR color_mode ", " color_smooth_stops
+steps (default) or smooth: a continuous gradient by age through the listed palette entries.
+.TP
+.BR ipc ", " ipc_path
+Control socket for \fBlife-wallpaper-ctl\fR (off by default).
+.TP
+.BR power ", " battery_threshold ", " battery_dim ", " battery_fps_scale ", " battery_disable
+Low-power mode on battery.
+.TP
+.BR idle ", " idle_secs ", " idle_fps_scale ", " idle_fastforward ", " idle_dim ", " idle_breathe
+A calmer board after a while without pointer or window activity (Hyprland only).
+.TP
+.BR mpris ", " mpris_player ", " mpris_artist_colors
+React to the active media player through playerctl.
+.TP
+.B grid
+square (default), hex (six neighbours, offset layout) or von-neumann (four neighbours).
+.TP
+.BR cursor ", " cursor_mode ", " cursor_radius ", " cursor_interval_ms
+Leave cells where the pointer goes (Hyprland). cursor_mode is trail, sparkle or soup.
+.TP
+.BR workspace_ripple ", " audio_band_bass_bloom ", " overlay_sparkline
+A ripple on workspace switches; a pulsar on sustained bass; a population sparkline above the overlay.
+.TP
+.BR command ", " command_interval_secs
+Lines printed by the command are events (JSON objects or control-socket commands).
+.TP
+.BR weather ", " weather_command ", " weather_interval_secs ", " weather_palette
+Tint the palette and add rain or snow from a wttr.in-style answer.
+.TP
+.B rule_shift_rules
+Comma separated rules a rule shift may swap in.
+.TP
+.BR stats ", " verbose ", " scenes_dir
+Diagnostics on stderr, and where named scenes are stored.
 .TP
 .BR breathe ", " breathe_secs
 Slowly vary the generation rate by this fraction.

@@ -22,6 +22,17 @@ impl Look {
     pub fn dim_frac(&self) -> f32 {
         self.dim as f32 / 32.0
     }
+
+    /// Also dim by `extra` (0..=0.8), multiplying with what is already
+    /// dimmed: night, battery and idle dimming stack instead of replacing
+    /// each other.
+    pub fn with_extra_dim(mut self, extra: f64) -> Look {
+        if extra > 0.0 {
+            let kept = (1.0 - self.dim_frac() as f64) * (1.0 - extra.clamp(0.0, 0.8));
+            self.dim = ((1.0 - kept) * 32.0).round().clamp(0.0, 26.0) as u8;
+        }
+        self
+    }
     #[cfg(test)]
     pub fn is_neutral(&self) -> bool {
         self.hue == 0 && self.dim == 0
@@ -84,7 +95,8 @@ pub fn local_minutes() -> Option<u32> {
 pub fn compute(cfg: &Config, elapsed: Duration, minutes: Option<u32>) -> Look {
     let mut look = Look::default();
     if cfg.hue_drift > 0.0 {
-        let phase = elapsed.as_secs_f64() / cfg.hue_drift_secs.max(1) as f64 * std::f64::consts::TAU;
+        let phase =
+            elapsed.as_secs_f64() / cfg.hue_drift_secs.max(1) as f64 * std::f64::consts::TAU;
         look.hue = (cfg.hue_drift * phase.sin()).round() as i16;
     }
     if cfg.night_dim > 0.0 {
@@ -108,11 +120,28 @@ pub fn rotate_hue(c: Rgb, deg: f32) -> Rgb {
     let (s, co) = deg.to_radians().sin_cos();
     let (i2, q2) = (i * co - q * s, i * s + q * co);
     let to = |v: f32| v.round().clamp(0.0, 255.0) as u8;
-    [to(y + 0.956 * i2 + 0.621 * q2), to(y - 0.272 * i2 - 0.647 * q2), to(y - 1.106 * i2 + 1.703 * q2)]
+    [
+        to(y + 0.956 * i2 + 0.621 * q2),
+        to(y - 0.272 * i2 - 0.647 * q2),
+        to(y - 1.106 * i2 + 1.703 * q2),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extra_dim_multiplies_with_night_dim() {
+        let night = Look { hue: 0, dim: 16 }; // half the brightness
+        let both = night.with_extra_dim(0.5); // half of that
+        assert_eq!(both.dim, 24);
+        assert_eq!(night.with_extra_dim(0.0), night);
+        assert_eq!(Look::default().with_extra_dim(0.5).dim, 16);
+        assert!(
+            Look { hue: 0, dim: 26 }.with_extra_dim(0.8).dim <= 26,
+            "never past the cap"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -136,7 +165,10 @@ mod tests {
         assert_eq!(rotate_hue(c, 0.0), c);
         let back = rotate_hue(c, 360.0);
         for k in 0..3 {
-            assert!((back[k] as i32 - c[k] as i32).abs() <= 2, "{back:?} vs {c:?}");
+            assert!(
+                (back[k] as i32 - c[k] as i32).abs() <= 2,
+                "{back:?} vs {c:?}"
+            );
         }
         assert_ne!(rotate_hue(c, 40.0), c);
         let grey = [0x28, 0x28, 0x28];
@@ -150,12 +182,20 @@ mod tests {
     fn compute_is_neutral_when_off_and_bounded_when_on() {
         let off = Config::default();
         assert!(compute(&off, Duration::from_secs(123), Some(23 * 60)).is_neutral());
-        let on = Config { hue_drift: 20.0, night_dim: 0.5, ..Config::default() };
+        let on = Config {
+            hue_drift: 20.0,
+            night_dim: 0.5,
+            ..Config::default()
+        };
         for t in (0..3600).step_by(37) {
             let l = compute(&on, Duration::from_secs(t), Some(2 * 60));
             assert!(l.hue.abs() <= 20);
             assert_eq!(l.dim, 16);
         }
-        assert_eq!(compute(&on, Duration::ZERO, None).dim, 0, "no clock, no dimming");
+        assert_eq!(
+            compute(&on, Duration::ZERO, None).dim,
+            0,
+            "no clock, no dimming"
+        );
     }
 }

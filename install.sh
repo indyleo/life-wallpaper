@@ -27,6 +27,7 @@ printf '%s\n' "Building life-wallpaper in release mode..."
 
 mkdir -p "$BIN_DIR" "$DATA_DIR/config_example" "$MAN_DIR" "$CONFIG_DIR"
 install -m 755 "$ROOT/target/release/life-wallpaper" "$BIN_DIR/life-wallpaper"
+install -m 755 "$ROOT/target/release/life-wallpaper-ctl" "$BIN_DIR/life-wallpaper-ctl"
 
 # Install examples for reference, and make the default config available on disk.
 for file in "$ROOT"/config_example/*.toml; do

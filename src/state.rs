@@ -10,15 +10,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::life::{Life, Rule};
+use crate::life::{Grid, Life, Rule};
 
+/// Square boards keep writing version 1 (older binaries can still read them);
+/// other grids write version 2, which names the grid, so a hex board is never
+/// loaded as a square one.
 const MAGIC: &str = "life-wallpaper-state 1";
+const MAGIC2: &str = "life-wallpaper-state 2";
 const MAX_DIM: usize = 16_384;
 
 pub struct Saved {
     pub cols: usize,
     pub rows: usize,
     pub rule: String,
+    pub grid: Grid,
     pub cells: Vec<u8>,
     pub age: Vec<u8>,
     /// Empty for files written before colonies existed.
@@ -33,12 +38,62 @@ pub fn state_dir() -> Option<PathBuf> {
     Some(base.join("life-wallpaper"))
 }
 
+/// File of the scene called `name` in `dir` (empty = `<state dir>/scenes`).
+/// Names are plain words, so a scene can never point outside its directory.
+pub fn scene_path(dir: &str, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "scene name {name:?} must be 1-64 letters, digits, - or _"
+        ));
+    }
+    let base = if dir.is_empty() {
+        state_dir()
+            .ok_or("no state directory (HOME is not set)")?
+            .join("scenes")
+    } else {
+        PathBuf::from(dir)
+    };
+    Ok(base.join(format!("{name}.scene")))
+}
+
+/// Save a scene, creating its directory.
+pub fn save_scene(dir: &str, name: &str, life: &Life, rule: Rule) -> Result<PathBuf, String> {
+    let path = scene_path(dir, name)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    save(&path, life, rule).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Read a scene.
+pub fn load_scene(dir: &str, name: &str) -> Result<Saved, String> {
+    let path = scene_path(dir, name)?;
+    load(&path).ok_or_else(|| {
+        format!(
+            "no scene {name:?} ({} is missing or unreadable)",
+            path.display()
+        )
+    })
+}
+
 /// State file for an output name (`None` = unknown name).
 pub fn path_for(output: Option<&str>) -> Option<PathBuf> {
     let name: String = output
         .unwrap_or("default")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Some(state_dir()?.join(format!("{name}.board")))
 }
@@ -50,7 +105,17 @@ pub fn save(path: &Path, life: &Life, rule: Rule) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut buf = format!("{MAGIC} {} {} {}\n", life.cols(), life.rows(), rule.name()).into_bytes();
+    let head = match life.grid() {
+        Grid::Square => format!("{MAGIC} {} {} {}\n", life.cols(), life.rows(), rule.name()),
+        g => format!(
+            "{MAGIC2} {} {} {} {}\n",
+            life.cols(),
+            life.rows(),
+            g.name(),
+            rule.name()
+        ),
+    };
+    let mut buf = head.into_bytes();
     buf.extend_from_slice(life.cells());
     buf.extend_from_slice(life.age());
     buf.extend_from_slice(life.colony());
@@ -63,11 +128,25 @@ pub fn save(path: &Path, life: &Life, rule: Rule) -> io::Result<()> {
 pub fn load(path: &Path) -> Option<Saved> {
     let data = fs::read(path).ok()?;
     let nl = data.iter().position(|&b| b == b'\n')?;
-    let head = std::str::from_utf8(&data[..nl]).ok()?.strip_prefix(MAGIC)?.trim();
-    let mut it = head.splitn(3, ' ');
-    let cols: usize = it.next()?.parse().ok()?;
-    let rows: usize = it.next()?.parse().ok()?;
-    let rule = it.next()?.to_string();
+    let text = std::str::from_utf8(&data[..nl]).ok()?;
+    let (cols, rows, grid, rule): (usize, usize, Grid, String) =
+        if let Some(h) = text.strip_prefix(MAGIC) {
+            let mut it = h.trim().splitn(3, ' ');
+            (
+                it.next()?.parse().ok()?,
+                it.next()?.parse().ok()?,
+                Grid::Square,
+                it.next()?.to_string(),
+            )
+        } else {
+            let mut it = text.strip_prefix(MAGIC2)?.trim().splitn(4, ' ');
+            (
+                it.next()?.parse().ok()?,
+                it.next()?.parse().ok()?,
+                Grid::parse(it.next()?)?,
+                it.next()?.to_string(),
+            )
+        };
     if cols == 0 || rows == 0 || cols > MAX_DIM || rows > MAX_DIM {
         return None;
     }
@@ -81,7 +160,15 @@ pub fn load(path: &Path) -> Option<Saved> {
     if cells.iter().any(|&c| c > 2) {
         return None;
     }
-    Some(Saved { cols, rows, rule, cells: cells.to_vec(), age: age.to_vec(), colony: colony.to_vec() })
+    Some(Saved {
+        cols,
+        rows,
+        rule,
+        grid,
+        cells: cells.to_vec(),
+        age: age.to_vec(),
+        colony: colony.to_vec(),
+    })
 }
 
 #[cfg(test)]
@@ -156,5 +243,55 @@ mod tests {
     fn output_names_are_sanitised() {
         let p = path_for(Some("DP-1/../x y")).unwrap();
         assert!(p.file_name().unwrap().to_str().unwrap() == "DP-1____x_y.board");
+    }
+
+    #[test]
+    fn scene_names_are_plain_words_and_scenes_round_trip() {
+        assert!(scene_path("/tmp/x", "../evil").is_err());
+        assert!(scene_path("/tmp/x", "").is_err());
+        assert!(scene_path("/tmp/x", "a b").is_err());
+        assert_eq!(
+            scene_path("/tmp/x", "night-1_a").unwrap(),
+            PathBuf::from("/tmp/x/night-1_a.scene")
+        );
+        let dir = std::env::temp_dir().join(format!("lw-scenes-{}", std::process::id()));
+        let mut l = Life::new(20, 10, 0, CONWAY);
+        l.place(&Pattern::from_art(&["###"]), 3, 3, 0);
+        let path = save_scene(dir.to_str().unwrap(), "t", &l, CONWAY).unwrap();
+        assert!(path.ends_with("t.scene"));
+        let back = load_scene(dir.to_str().unwrap(), "t").unwrap();
+        assert_eq!(back.cells, l.cells());
+        assert!(load_scene(dir.to_str().unwrap(), "missing").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn square_boards_keep_the_old_format_and_other_grids_cannot_be_mistaken_for_square() {
+        let dir = std::env::temp_dir().join(format!("lw-grid-{}", std::process::id()));
+        let mut l = Life::new(12, 8, 0, CONWAY);
+        let p = dir.join("sq.state");
+        save(&p, &l, CONWAY).unwrap();
+        assert!(
+            fs::read(&p)
+                .unwrap()
+                .starts_with(b"life-wallpaper-state 1 12 8"),
+            "unchanged for square"
+        );
+        assert_eq!(load(&p).unwrap().grid, Grid::Square);
+        l.set_grid(Grid::Hex);
+        let p2 = dir.join("hex.state");
+        save(&p2, &l, CONWAY).unwrap();
+        assert!(fs::read(&p2)
+            .unwrap()
+            .starts_with(b"life-wallpaper-state 2 12 8 hex"));
+        let back = load(&p2).unwrap();
+        assert_eq!((back.grid, back.cols, back.rows), (Grid::Hex, 12, 8));
+        // a corrupted grid name is rejected rather than guessed
+        let mut bytes = fs::read(&p2).unwrap();
+        let pos = bytes.windows(3).position(|w| w == b"hex").unwrap();
+        bytes[pos..pos + 3].copy_from_slice(b"xyz");
+        fs::write(&p2, bytes).unwrap();
+        assert!(load(&p2).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

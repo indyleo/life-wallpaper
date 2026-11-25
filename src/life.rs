@@ -10,17 +10,71 @@ use crate::patterns::{self, Pattern};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Rule {
     /// Bit n of `birth`/`survive` set => n live neighbours triggers it.
-    LifeLike { birth: u16, survive: u16 },
+    LifeLike {
+        birth: u16,
+        survive: u16,
+    },
     Brain,
 }
 
-pub const CONWAY: Rule = Rule::LifeLike { birth: 1 << 3, survive: (1 << 2) | (1 << 3) };
-pub const HIGHLIFE: Rule = Rule::LifeLike { birth: (1 << 3) | (1 << 6), survive: (1 << 2) | (1 << 3) };
+/// Neighbourhood / topology of the board.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Grid {
+    /// Eight neighbours (Moore). The classic board.
+    #[default]
+    Square,
+    /// Six neighbours on an offset layout (odd rows shifted half a cell).
+    /// Wants an even number of rows so the wrap-around keeps its parity.
+    Hex,
+    /// Four neighbours (up, down, left, right).
+    VonNeumann,
+}
+
+impl Grid {
+    pub fn parse(s: &str) -> Option<Grid> {
+        match s.to_ascii_lowercase().replace('_', "-").as_str() {
+            "square" | "moore" => Some(Grid::Square),
+            "hex" | "hexagonal" => Some(Grid::Hex),
+            "von-neumann" | "vonneumann" | "neumann" => Some(Grid::VonNeumann),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Grid::Square => "square",
+            Grid::Hex => "hex",
+            Grid::VonNeumann => "von-neumann",
+        }
+    }
+
+    /// Most neighbours a cell can have (rules only matter up to this).
+    #[cfg(test)]
+    pub fn neighbours(self) -> usize {
+        match self {
+            Grid::Square => 8,
+            Grid::Hex => 6,
+            Grid::VonNeumann => 4,
+        }
+    }
+}
+
+pub const CONWAY: Rule = Rule::LifeLike {
+    birth: 1 << 3,
+    survive: (1 << 2) | (1 << 3),
+};
+pub const HIGHLIFE: Rule = Rule::LifeLike {
+    birth: (1 << 3) | (1 << 6),
+    survive: (1 << 2) | (1 << 3),
+};
 pub const DAY_NIGHT: Rule = Rule::LifeLike {
     birth: (1 << 3) | (1 << 6) | (1 << 7) | (1 << 8),
     survive: (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 8),
 };
-pub const SEEDS: Rule = Rule::LifeLike { birth: 1 << 2, survive: 0 };
+pub const SEEDS: Rule = Rule::LifeLike {
+    birth: 1 << 2,
+    survive: 0,
+};
 
 /// Order used by `rule = "rotate"`.
 pub const ROTATION: [Rule; 5] = [CONWAY, HIGHLIFE, DAY_NIGHT, SEEDS, Rule::Brain];
@@ -51,7 +105,10 @@ impl Rule {
             }
             Some(m)
         };
-        Some(Rule::LifeLike { birth: mask(b)?, survive: mask(sv)? })
+        Some(Rule::LifeLike {
+            birth: mask(b)?,
+            survive: mask(sv)?,
+        })
     }
 
     pub fn name(&self) -> String {
@@ -62,7 +119,12 @@ impl Rule {
             r if r == SEEDS => "seeds".into(),
             Rule::Brain => "brain".into(),
             Rule::LifeLike { birth, survive } => {
-                let digits = |m: u16| (0..=8).filter(|n| m >> n & 1 == 1).map(|n| n.to_string()).collect::<String>();
+                let digits = |m: u16| {
+                    (0..=8)
+                        .filter(|n| m >> n & 1 == 1)
+                        .map(|n| n.to_string())
+                        .collect::<String>()
+                };
                 format!("b{}/s{}", digits(birth), digits(survive))
             }
         }
@@ -115,6 +177,48 @@ fn rnd(state: &mut u64) -> u32 {
 /// Colony of a newborn cell: the majority among its live neighbours (ties
 /// broken at random), or now and then a random colony (mutation).
 #[inline]
+/// Indices of the neighbours of (x, y) on a torus, and how many there are.
+/// Hex is the "odd-r" offset layout: odd rows sit half a cell to the right, so
+/// the two cells above (and below) are x-1,x on even rows and x,x+1 on odd rows.
+fn topo_neighbours(
+    grid: Grid,
+    cols: usize,
+    rows: usize,
+    x: usize,
+    y: usize,
+    out: &mut [usize; 8],
+) -> usize {
+    let l = if x == 0 { cols - 1 } else { x - 1 };
+    let r = if x + 1 == cols { 0 } else { x + 1 };
+    let u = if y == 0 { rows - 1 } else { y - 1 };
+    let d = if y + 1 == rows { 0 } else { y + 1 };
+    let at = |xx: usize, yy: usize| yy * cols + xx;
+    match grid {
+        Grid::VonNeumann => {
+            out[..4].copy_from_slice(&[at(x, u), at(x, d), at(l, y), at(r, y)]);
+            4
+        }
+        Grid::Hex => {
+            let (a, b) = if y & 1 == 0 { (l, x) } else { (x, r) };
+            out[..6].copy_from_slice(&[at(l, y), at(r, y), at(a, u), at(b, u), at(a, d), at(b, d)]);
+            6
+        }
+        Grid::Square => {
+            out.copy_from_slice(&[
+                at(l, u),
+                at(x, u),
+                at(r, u),
+                at(l, y),
+                at(r, y),
+                at(l, d),
+                at(x, d),
+                at(r, d),
+            ]);
+            8
+        }
+    }
+}
+
 fn inherit(cur: &[u8], colony: &[u8], nb: [usize; 8], nc: u8, mut_thr: u32, rng: &mut u64) -> u8 {
     if mut_thr > 0 && rnd(rng) < mut_thr {
         return (rnd(rng) % nc as u32) as u8;
@@ -176,6 +280,7 @@ pub struct Life {
     /// ... with this per-generation probability (scaled to u32).
     decay_thr: u32,
     alt: Option<Alt>,
+    grid: Grid,
     rng: u64,
 }
 
@@ -210,6 +315,7 @@ impl Life {
             decay_after: 0,
             decay_thr: 0,
             alt: None,
+            grid: Grid::Square,
             rng: rand::thread_rng().gen::<u64>() | 1,
         }
     }
@@ -226,7 +332,11 @@ impl Life {
     pub fn begin_alt(&mut self, rule: Rule) -> bool {
         match (self.rule, rule) {
             (Rule::LifeLike { .. }, Rule::LifeLike { birth, survive }) => {
-                self.alt = Some(Alt { birth, survive, mask: vec![0; self.cur.len()] });
+                self.alt = Some(Alt {
+                    birth,
+                    survive,
+                    mask: vec![0; self.cur.len()],
+                });
                 true
             }
             _ => false,
@@ -251,7 +361,9 @@ impl Life {
     /// How many cells currently follow the alternative rule.
     #[cfg(test)]
     pub fn alt_cells(&self) -> usize {
-        self.alt.as_ref().map_or(0, |a| a.mask.iter().filter(|&&m| m != 0).count())
+        self.alt
+            .as_ref()
+            .map_or(0, |a| a.mask.iter().filter(|&&m| m != 0).count())
     }
 
     pub fn cols(&self) -> usize {
@@ -322,8 +434,15 @@ impl Life {
         }
         let (cols, rows, nc) = (self.cols, self.rows, self.ncolonies);
         let k = (cols * rows / 1600).clamp(4, 14);
-        let pts: Vec<(usize, usize, u8)> =
-            (0..k).map(|_| (rng.gen_range(0..cols), rng.gen_range(0..rows), rng.gen_range(0..nc))).collect();
+        let pts: Vec<(usize, usize, u8)> = (0..k)
+            .map(|_| {
+                (
+                    rng.gen_range(0..cols),
+                    rng.gen_range(0..rows),
+                    rng.gen_range(0..nc),
+                )
+            })
+            .collect();
         for y in 0..rows {
             for x in 0..cols {
                 let mut best = (usize::MAX, 0u8);
@@ -403,9 +522,25 @@ impl Life {
     }
 
     /// Advance one generation (edges wrap). Returns `true` if any cell changed.
+    pub fn grid(&self) -> Grid {
+        self.grid
+    }
+
+    /// Change the topology. The caller reseeds: a board grown on one
+    /// neighbourhood means nothing on another.
+    pub fn set_grid(&mut self, g: Grid) {
+        if g != self.grid {
+            self.grid = g;
+            self.alt = None;
+        }
+    }
+
     pub fn step(&mut self) -> bool {
         let changed = match self.rule {
-            Rule::LifeLike { birth, survive } if self.alt.is_some() => self.step_lifelike::<true>(birth, survive),
+            _ if self.grid != Grid::Square => self.step_topo(),
+            Rule::LifeLike { birth, survive } if self.alt.is_some() => {
+                self.step_lifelike::<true>(birth, survive)
+            }
             Rule::LifeLike { birth, survive } => self.step_lifelike::<false>(birth, survive),
             Rule::Brain => self.step_brain(),
         };
@@ -417,7 +552,12 @@ impl Life {
         let mut rng = self.rng;
         for i in 0..self.cur.len() {
             let (was, mut now) = (self.cur[i], self.next[i]);
-            if decay && was == 1 && now == 1 && self.settled[i] >= self.decay_after && rnd(&mut rng) < self.decay_thr {
+            if decay
+                && was == 1
+                && now == 1
+                && self.settled[i] >= self.decay_after
+                && rnd(&mut rng) < self.decay_thr
+            {
                 self.next[i] = 0;
                 now = 0;
             }
@@ -434,7 +574,11 @@ impl Life {
             };
             let h = (self.hist[i] << 1) | (now != 0) as u64;
             self.hist[i] = h;
-            self.settled[i] = if now == 1 && is_periodic(h) { self.settled[i].saturating_add(1) } else { 0 };
+            self.settled[i] = if now == 1 && is_periodic(h) {
+                self.settled[i].saturating_add(1)
+            } else {
+                0
+            };
         }
         self.rng = rng;
         std::mem::swap(&mut self.cur, &mut self.next);
@@ -444,6 +588,62 @@ impl Life {
     /// `MIXED` = some cells follow the alternative rule (`self.alt`). The plain
     /// path is compiled without the per-cell lookup, so a board with no ripple
     /// running costs exactly what it did before.
+    /// One generation on a hex or von Neumann board. The square board has its
+    /// own unrolled fast path; this one looks the neighbours up per cell.
+    fn step_topo(&mut self) -> bool {
+        let (cols, rows, grid) = (self.cols, self.rows, self.grid);
+        let (birth, survive, brain) = match self.rule {
+            Rule::LifeLike { birth, survive } => (birth, survive, false),
+            Rule::Brain => (0, 0, true),
+        };
+        let (cur, next, colony) = (&self.cur, &mut self.next, &mut self.colony);
+        let (alt_mask, alt_b, alt_s): (&[u8], u16, u16) = match self.alt.as_ref() {
+            Some(a) if !brain => (&a.mask, a.birth, a.survive),
+            _ => (&[], birth, survive),
+        };
+        let (nc, mut_thr) = (self.ncolonies, self.mutation);
+        let mut rng = self.rng;
+        let mut changed = false;
+        let mut nb = [0usize; 8];
+        for y in 0..rows {
+            for x in 0..cols {
+                let i = y * cols + x;
+                let k = topo_neighbours(grid, cols, rows, x, y, &mut nb);
+                // unused slots point at the cell itself, which is dead whenever a birth is decided
+                for slot in nb.iter_mut().skip(k) {
+                    *slot = i;
+                }
+                let mut n = 0u8;
+                for &j in &nb[..k] {
+                    n += (cur[j] == 1) as u8;
+                }
+                let alive = cur[i];
+                let v = if brain {
+                    match alive {
+                        0 => (n == 2) as u8,
+                        1 => 2,
+                        _ => 0,
+                    }
+                } else {
+                    let (b, sv) = if !alt_mask.is_empty() && alt_mask[i] != 0 {
+                        (alt_b, alt_s)
+                    } else {
+                        (birth, survive)
+                    };
+                    let mask = if alive == 1 { sv } else { b };
+                    (mask >> n & 1) as u8
+                };
+                next[i] = v;
+                changed |= v != alive;
+                if alive == 0 && v == 1 && nc >= 2 {
+                    colony[i] = inherit(cur, colony, nb, nc, mut_thr, &mut rng);
+                }
+            }
+        }
+        self.rng = rng;
+        changed
+    }
+
     fn step_lifelike<const MIXED: bool>(&mut self, birth: u16, survive: u16) -> bool {
         let (cols, rows) = (self.cols, self.rows);
         let (cur, next, colony) = (&self.cur, &mut self.next, &mut self.colony);
@@ -470,7 +670,11 @@ impl Life {
                     + cur[down + x]
                     + cur[down + r];
                 let alive = cur[row + x];
-                let (b, sv) = if MIXED && alt_mask[row + x] != 0 { (alt_b, alt_s) } else { (birth, survive) };
+                let (b, sv) = if MIXED && alt_mask[row + x] != 0 {
+                    (alt_b, alt_s)
+                } else {
+                    (birth, survive)
+                };
                 let mask = if alive == 1 { sv } else { b };
                 let v = (mask >> n & 1) as u8;
                 next[row + x] = v;
@@ -479,7 +683,16 @@ impl Life {
                     // Births only happen on cells that are dead in `cur`, and
                     // only live cells' colours are ever read, so writing in
                     // place cannot disturb the neighbours of this pass.
-                    let nb = [up + l, up + x, up + r, row + l, row + r, down + l, down + x, down + r];
+                    let nb = [
+                        up + l,
+                        up + x,
+                        up + r,
+                        row + l,
+                        row + r,
+                        down + l,
+                        down + x,
+                        down + r,
+                    ];
                     let c = inherit(cur, colony, nb, nc, mut_thr, &mut rng);
                     colony[row + x] = c;
                 }
@@ -503,7 +716,14 @@ impl Life {
                 let l = if x == 0 { cols - 1 } else { x - 1 };
                 let r = if x + 1 == cols { 0 } else { x + 1 };
                 let on = |i: usize| (cur[i] == 1) as u8;
-                let n = on(up + l) + on(up + x) + on(up + r) + on(row + l) + on(row + r) + on(down + l) + on(down + x) + on(down + r);
+                let n = on(up + l)
+                    + on(up + x)
+                    + on(up + r)
+                    + on(row + l)
+                    + on(row + r)
+                    + on(down + l)
+                    + on(down + x)
+                    + on(down + r);
                 let c = cur[row + x];
                 let v = match c {
                     0 => (n == 2) as u8,
@@ -513,7 +733,16 @@ impl Life {
                 next[row + x] = v;
                 changed |= v != c;
                 if c == 0 && v == 1 && nc >= 2 {
-                    let nb = [up + l, up + x, up + r, row + l, row + r, down + l, down + x, down + r];
+                    let nb = [
+                        up + l,
+                        up + x,
+                        up + r,
+                        row + l,
+                        row + r,
+                        down + l,
+                        down + x,
+                        down + r,
+                    ];
                     let col = inherit(cur, colony, nb, nc, mut_thr, &mut rng);
                     colony[row + x] = col;
                 }
@@ -557,13 +786,22 @@ impl Life {
         let (x1, y1) = ((x + w).min(self.cols), (y + h).min(self.rows));
         let mut n = 0;
         for yy in y..y1 {
-            n += self.cur[yy * self.cols + x..yy * self.cols + x1].iter().filter(|&&c| c != 0).count();
+            n += self.cur[yy * self.cols + x..yy * self.cols + x1]
+                .iter()
+                .filter(|&&c| c != 0)
+                .count();
         }
         n
     }
 
     /// Top-left of the emptiest of `tries` random `w` x `h` rectangles.
-    pub fn emptiest_spot<R: Rng>(&self, rng: &mut R, w: usize, h: usize, tries: usize) -> (usize, usize) {
+    pub fn emptiest_spot<R: Rng>(
+        &self,
+        rng: &mut R,
+        w: usize,
+        h: usize,
+        tries: usize,
+    ) -> (usize, usize) {
         let (w, h) = (w.min(self.cols), h.min(self.rows));
         let mut best = (0, 0);
         let mut best_n = usize::MAX;
@@ -582,7 +820,15 @@ impl Life {
     /// Indices of currently empty cells in a rectangle, each picked with
     /// probability `density`. Used to drip a soup patch in over a few ticks.
     #[cfg(test)]
-    pub fn soup_cells<R: Rng>(&self, rng: &mut R, x: usize, y: usize, w: usize, h: usize, density: f64) -> Vec<usize> {
+    pub fn soup_cells<R: Rng>(
+        &self,
+        rng: &mut R,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        density: f64,
+    ) -> Vec<usize> {
         let d = density.clamp(0.0, 1.0);
         let mut out = Vec::new();
         for yy in y..(y + h).min(self.rows) {
@@ -719,6 +965,11 @@ impl Life {
             return self.place_east_ship_on_edge(rng, &patterns::lwss());
         }
         let edge = rng.gen_range(0..4); // 0 top, 1 bottom, 2 left, 3 right
+        self.place_glider_at_edge(rng, edge)
+    }
+
+    /// A glider entering from `edge` (0 top, 1 bottom, 2 left, 3 right).
+    pub fn place_glider_at_edge<R: Rng>(&mut self, rng: &mut R, edge: usize) -> bool {
         let flip = rng.gen_bool(0.5);
         let pat = {
             // heads SE; mirror so the heading has a positive component away from the edge
@@ -748,6 +999,16 @@ impl Life {
     /// transposed / mirrored so it flies inwards. Only its own cells are touched.
     pub fn place_east_ship_on_edge<R: Rng>(&mut self, rng: &mut R, ship: &Pattern) -> bool {
         let edge = rng.gen_range(0..4);
+        self.place_east_ship_at_edge(rng, ship, edge)
+    }
+
+    /// Like `place_east_ship_on_edge`, from a chosen edge (0 top, 1 bottom, 2 left, 3 right).
+    pub fn place_east_ship_at_edge<R: Rng>(
+        &mut self,
+        rng: &mut R,
+        ship: &Pattern,
+        edge: usize,
+    ) -> bool {
         let flip = rng.gen_bool(0.5);
         let pat = oriented(ship, edge, flip);
         if pat.w > self.cols || pat.h > self.rows {
@@ -769,7 +1030,11 @@ impl Life {
     pub fn place_convoy<R: Rng>(&mut self, rng: &mut R, ship: &Pattern, n: usize) -> usize {
         let edge = rng.gen_range(0..4);
         let pat = oriented(ship, edge, rng.gen_bool(0.5));
-        let (along_len, lane) = if edge < 2 { (self.cols, pat.w + 5) } else { (self.rows, pat.h + 5) };
+        let (along_len, lane) = if edge < 2 {
+            (self.cols, pat.w + 5)
+        } else {
+            (self.rows, pat.h + 5)
+        };
         let (pw, ph) = (pat.w, pat.h);
         if pw > self.cols || ph > self.rows {
             return 0;
@@ -811,7 +1076,13 @@ impl Life {
         let dist = 18i64;
         let sx = (cx as i64 - dx * dist).clamp(0, (self.cols - pat.w) as i64) as usize;
         let sy = (cy as i64 - dy * dist).clamp(0, (self.rows - pat.h) as i64) as usize;
-        if self.count_in(sx.saturating_sub(1), sy.saturating_sub(1), pat.w + 2, pat.h + 2) > 0 {
+        if self.count_in(
+            sx.saturating_sub(1),
+            sy.saturating_sub(1),
+            pat.w + 2,
+            pat.h + 2,
+        ) > 0
+        {
             return false;
         }
         self.place(&pat, sx, sy, 0);
@@ -825,7 +1096,9 @@ impl Life {
         let (cols, rows, n) = (self.cols, self.rows, self.cur.len());
         // A few random probes find a live cell on any normally populated board;
         // on a very sparse one fall back to scanning from a random start.
-        let mut pick = (0..48).map(|_| rng.gen_range(0..n)).find(|&i| self.cur[i] == 1);
+        let mut pick = (0..48)
+            .map(|_| rng.gen_range(0..n))
+            .find(|&i| self.cur[i] == 1);
         if pick.is_none() {
             let start = rng.gen_range(0..n);
             pick = (0..n).map(|k| (start + k) % n).find(|&i| self.cur[i] == 1);
@@ -886,7 +1159,16 @@ impl Life {
 
     /// Like `soup_cells`, but the patch is mirror / rotation symmetric. Each
     /// symmetry orbit is rolled once, so the pattern really is symmetric.
-    pub fn soup_cells_sym<R: Rng>(&self, rng: &mut R, x: usize, y: usize, w: usize, h: usize, density: f64, sym: Sym) -> Vec<usize> {
+    pub fn soup_cells_sym<R: Rng>(
+        &self,
+        rng: &mut R,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        density: f64,
+        sym: Sym,
+    ) -> Vec<usize> {
         if x >= self.cols || y >= self.rows {
             return Vec::new();
         }
@@ -938,7 +1220,13 @@ impl Life {
     }
 
     /// Place at a random position with at least `margin` free cells to the border.
-    pub fn place_random<R: Rng>(&mut self, rng: &mut R, pat: &Pattern, margin: usize, clear: usize) -> bool {
+    pub fn place_random<R: Rng>(
+        &mut self,
+        rng: &mut R,
+        pat: &Pattern,
+        margin: usize,
+        clear: usize,
+    ) -> bool {
         if pat.w + 2 * margin > self.cols || pat.h + 2 * margin > self.rows {
             return false;
         }
@@ -1108,7 +1396,15 @@ mod tests {
 
     #[test]
     fn load_copies_overlap() {
-        let saved = crate::state::Saved { cols: 4, rows: 4, rule: "life".into(), cells: (0..16).map(|i| (i == 5) as u8).collect(), age: vec![7; 16], colony: vec![] };
+        let saved = crate::state::Saved {
+            cols: 4,
+            rows: 4,
+            rule: "life".into(),
+            cells: (0..16).map(|i| (i == 5) as u8).collect(),
+            age: vec![7; 16],
+            colony: vec![],
+            grid: Grid::Square,
+        };
         let mut l = Life::new(8, 2, 0, CONWAY);
         l.load(&saved);
         assert_eq!(l.cells()[8 + 1], 1);
@@ -1147,7 +1443,11 @@ mod tests {
         l.step(); // the L-tromino fills in its fourth corner
         let born = 2 * 8 + 2;
         assert_eq!(l.cells()[born], 1);
-        assert_eq!(l.colony()[born], 1, "two parents of colony 1 beat one of colony 3");
+        assert_eq!(
+            l.colony()[born],
+            1,
+            "two parents of colony 1 beat one of colony 3"
+        );
         assert_eq!(l.colony()[8 + 2], 1, "survivors keep their colony");
     }
 
@@ -1191,7 +1491,11 @@ mod tests {
             a.step();
             b.step();
         }
-        assert_eq!(a.cells(), b.cells(), "colours must never influence the rules");
+        assert_eq!(
+            a.cells(),
+            b.cells(),
+            "colours must never influence the rules"
+        );
     }
 
     #[test]
@@ -1204,7 +1508,11 @@ mod tests {
         for _ in 0..40 {
             l.step();
         }
-        assert_eq!(l.population(), 12 - 0 + 0, "nothing decays before the 64-generation history shows it");
+        assert_eq!(
+            l.population(),
+            12 - 0 + 0,
+            "nothing decays before the 64-generation history shows it"
+        );
         for _ in 0..100 {
             l.step();
         }
@@ -1226,7 +1534,10 @@ mod tests {
     fn cosmic_rays_change_the_board_and_need_a_live_cell() {
         let mut rng = rand::thread_rng();
         let mut l = Life::new(20, 20, 3, CONWAY);
-        assert!(!l.cosmic_ray(&mut rng), "empty board has nothing to disturb");
+        assert!(
+            !l.cosmic_ray(&mut rng),
+            "empty board has nothing to disturb"
+        );
         l.place(&Pattern::from_art(&["##", "##"]), 8, 8, 0);
         assert!(l.cosmic_ray(&mut rng));
         assert_ne!(l.population(), 4);
@@ -1251,7 +1562,10 @@ mod tests {
                     Sym::None => vec![],
                 };
                 for (mx, my) in mirrors {
-                    assert!(set.contains(&((y + my) * 60 + x + mx)), "{sym:?}: cell ({dx},{dy}) has no mirror");
+                    assert!(
+                        set.contains(&((y + my) * 60 + x + mx)),
+                        "{sym:?}: cell ({dx},{dy}) has no mirror"
+                    );
                 }
             }
         }
@@ -1271,7 +1585,10 @@ mod tests {
         let mut out = vec![0u32; 4 * 2];
         l.tile_activity(16, 4, &mut out);
         assert_eq!(out[0], 0, "a block is settled");
-        assert!(out[1..4].iter().sum::<u32>() + out[4..].iter().sum::<u32>() >= 5, "the glider counts: {out:?}");
+        assert!(
+            out[1..4].iter().sum::<u32>() + out[4..].iter().sum::<u32>() >= 5,
+            "the glider counts: {out:?}"
+        );
     }
 
     #[test]
@@ -1289,7 +1606,11 @@ mod tests {
         for _ in 0..40 {
             l.step();
         }
-        let min_x = (0..80 * 40).filter(|&i| l.cells()[i] == 1).map(|i| i % 80).min().unwrap();
+        let min_x = (0..80 * 40)
+            .filter(|&i| l.cells()[i] == 1)
+            .map(|i| i % 80)
+            .min()
+            .unwrap();
         assert!(min_x >= 15, "ship flew east: {min_x}");
     }
 
@@ -1308,7 +1629,10 @@ mod tests {
                 // flying inwards means moving towards the middle of the board
                 let mid = (40.0, 30.0);
                 let d = |c: (f64, f64)| ((c.0 - mid.0).powi(2) + (c.1 - mid.1).powi(2)).sqrt();
-                assert!(d(c1) < d(c0), "ship moved away from the centre: {c0:?} -> {c1:?}");
+                assert!(
+                    d(c1) < d(c0),
+                    "ship moved away from the centre: {c0:?} -> {c1:?}"
+                );
             }
         }
     }
@@ -1388,6 +1712,103 @@ mod tests {
         assert_eq!(l.colony().len(), 170 * 95);
         assert_eq!(l.colony()[3 * 170 + 3], before);
         assert!(l.set_colonies(0, 0.0) == false);
-        assert!(l.set_colonies(4, 0.0), "switching colonies on is reported so the caller can scatter");
+        assert!(
+            l.set_colonies(4, 0.0),
+            "switching colonies on is reported so the caller can scatter"
+        );
+    }
+
+    #[test]
+    fn hex_and_von_neumann_neighbourhoods_are_symmetric_and_the_right_size() {
+        for grid in [Grid::Hex, Grid::VonNeumann, Grid::Square] {
+            let (cols, rows) = (7usize, 8usize); // even rows: the hex wrap keeps its parity
+            let mut seen = vec![Vec::new(); cols * rows];
+            for y in 0..rows {
+                for x in 0..cols {
+                    let mut nb = [0usize; 8];
+                    let k = topo_neighbours(grid, cols, rows, x, y, &mut nb);
+                    assert_eq!(k, grid.neighbours());
+                    let mut v = nb[..k].to_vec();
+                    v.sort();
+                    v.dedup();
+                    assert_eq!(v.len(), k, "{grid:?} ({x},{y}) has distinct neighbours");
+                    assert!(
+                        !v.contains(&(y * cols + x)),
+                        "a cell is not its own neighbour"
+                    );
+                    seen[y * cols + x] = v;
+                }
+            }
+            for i in 0..cols * rows {
+                for &j in &seen[i] {
+                    assert!(
+                        seen[j].contains(&i),
+                        "{grid:?}: {i} sees {j} but not the other way round"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_lone_cell_spreads_to_exactly_its_neighbours_on_each_grid() {
+        // birth with exactly one neighbour, nothing survives
+        let seeds = Rule::LifeLike {
+            birth: 1 << 1,
+            survive: 0,
+        };
+        for (grid, expect) in [
+            (Grid::Hex, 6usize),
+            (Grid::VonNeumann, 4),
+            (Grid::Square, 8),
+        ] {
+            let mut l = Life::new(10, 10, 0, seeds);
+            l.set_grid(grid);
+            l.set_alive(5 * 10 + 5);
+            l.step();
+            assert_eq!(l.population(), expect, "{grid:?}");
+        }
+    }
+
+    #[test]
+    fn hex_rules_use_six_neighbours_and_colonies_still_inherit() {
+        // B2/S on hex: two live neighbours give birth
+        let rule = Rule::LifeLike {
+            birth: 1 << 2,
+            survive: 0,
+        };
+        let mut l = Life::new(8, 8, 0, rule);
+        l.set_grid(Grid::Hex);
+        l.set_colonies(3, 0.0);
+        l.set_brush(2);
+        l.set_alive(3 * 8 + 3);
+        l.set_alive(3 * 8 + 5);
+        l.step();
+        assert!(l.population() > 0);
+        assert!(
+            l.cells()
+                .iter()
+                .zip(l.colony())
+                .filter(|(&c, _)| c == 1)
+                .all(|(_, &col)| col == 2),
+            "newborns inherit the only colony around"
+        );
+    }
+
+    #[test]
+    fn switching_the_grid_keeps_square_boards_on_the_fast_path() {
+        let mut a = Life::new(20, 20, 0, CONWAY);
+        let mut b = Life::new(20, 20, 0, CONWAY);
+        b.set_grid(Grid::Hex);
+        b.set_grid(Grid::Square);
+        for l in [&mut a, &mut b] {
+            l.place(&patterns::glider(), 4, 4, 0);
+        }
+        for _ in 0..8 {
+            a.step();
+            b.step();
+        }
+        assert_eq!(a.cells(), b.cells());
+        assert_eq!(b.grid(), Grid::Square);
     }
 }

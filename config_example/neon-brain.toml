@@ -20,3 +20,10 @@ ancient = "#f7f0ff"
 dying = "#2d2454"
 overlay_color = "#c4b5fd"
 colony_colors = "#ff65d4,#9b7bff,#4bdcff,#f7f0ff"
+
+# Audio (only with audio = true): strong glow and a flash on every beat
+audio_react = true
+audio_glow = 0.7
+audio_flash = 0.8
+audio_brighten = 0.5
+audio_bg = 0.12

@@ -19,3 +19,11 @@ old = "#16852b"
 ancient = "#075c1b"
 rain_color = "#3cff70"
 overlay_color = "#78e890"
+
+# Audio (only with audio = true): only the background pulses, no gliders, no extra glow
+audio_gliders = false
+audio_react = true
+audio_bg = 0.2
+audio_brighten = 0
+audio_glow = 0
+audio_flash = 0

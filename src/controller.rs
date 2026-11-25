@@ -19,14 +19,15 @@
 //!
 //! Pure logic driven by `tick(now, ..)`; no Wayland in here.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 
-use crate::config::{ColorMode, Config, RuleSel, ShiftMode};
+use crate::config::{ColorMode, Config, CursorMode, RuleSel, ShiftMode};
 use crate::font::Font;
 use crate::hypr::HyprEvent;
-use crate::life::{Life, Rule, Sym, ROTATION, SYMMETRIES};
+use crate::life::{Grid, Life, Rule, Sym, ROTATION, SYMMETRIES};
 use crate::patterns;
 use crate::state::Saved;
 
@@ -73,11 +74,43 @@ const HALO: usize = 3;
 /// The bloom of a closed window covers at most this much (cells).
 const BLOOM_MAX: (usize, usize) = (48, 28);
 
-/// Rules a shift can swap in. All are Life plus extra survival or birth, so a
-/// short burst loosens still lifes and oscillators and wakes the board up
-/// without wiping it (measured: a few dozen generations roughly double the
-/// activity and leave fewer settled cells behind; longer bursts flood the grid).
-const SHIFT_RULES: [&str; 3] = ["b34/s23", "b3/s234", "b3/s2345"];
+/// Seconds of history the sparkline keeps.
+pub const SPARK_LEN: usize = 60;
+
+/// Injections from the control socket (and mid-band sparks) may follow each
+/// other this closely. Every source shares the one `last_event` clock.
+const IPC_COOLDOWN: Duration = Duration::from_millis(150);
+
+/// A screen edge, for `inject ... --edge`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl Edge {
+    pub fn parse(s: &str) -> Option<Edge> {
+        match s.to_ascii_lowercase().as_str() {
+            "top" | "t" | "n" => Some(Edge::Top),
+            "bottom" | "b" | "s" => Some(Edge::Bottom),
+            "left" | "l" | "w" => Some(Edge::Left),
+            "right" | "r" | "e" => Some(Edge::Right),
+            _ => None,
+        }
+    }
+
+    /// The numbering `Life` uses: 0 top, 1 bottom, 2 left, 3 right.
+    fn index(self) -> usize {
+        match self {
+            Edge::Top => 0,
+            Edge::Bottom => 1,
+            Edge::Left => 2,
+            Edge::Right => 3,
+        }
+    }
+}
 
 pub const RAIN_LEVELS: u8 = 8;
 
@@ -94,7 +127,15 @@ impl Spot {
     /// A rectangle in logical pixels, relative to the output's corner, as the
     /// cells it touches, clipped to the grid. `None` if nothing is left (the
     /// window is on another output, or entirely off this one).
-    pub fn from_px(x: i32, y: i32, w: i32, h: i32, cell_px: usize, cols: usize, rows: usize) -> Option<Spot> {
+    pub fn from_px(
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        cell_px: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Option<Spot> {
         if w <= 0 || h <= 0 || cell_px == 0 {
             return None;
         }
@@ -107,7 +148,12 @@ impl Spot {
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
-        Some(Spot { x: x0 as usize, y: y0 as usize, w: (x1 - x0) as usize, h: (y1 - y0) as usize })
+        Some(Spot {
+            x: x0 as usize,
+            y: y0 as usize,
+            w: (x1 - x0) as usize,
+            h: (y1 - y0) as usize,
+        })
     }
 }
 
@@ -222,6 +268,9 @@ pub struct Sim {
     next_shift: Instant,
     next_local: Instant,
     last_tick: Instant,
+    /// When the last injection from *any* source (Hyprland, audio, control
+    /// socket) happened; each source has its own minimum spacing but they all
+    /// measure from here, so two of them can never fire in the same tick.
     last_event: Option<Instant>,
     history: [u64; HISTORY],
     hist_len: usize,
@@ -237,8 +286,12 @@ pub struct Sim {
     ripple: Option<Ripple>,
     next_clock_stamp: Instant,
     clock_min: Option<u32>,
-    last_beat: Option<Instant>,
+    /// Population / settled counts, one per second, for the sparkline (only filled while it is on).
+    spark: VecDeque<(usize, usize)>,
+    next_spark: Instant,
     guns: Vec<Gun>,
+    /// Low-power mode: no Gosper guns.
+    guns_off: bool,
     /// Per-tile "quiet since" clocks for local calm detection.
     tile: usize,
     tcols: usize,
@@ -297,6 +350,7 @@ impl Sim {
             RuleSel::Rotate => ROTATION[0],
         };
         let mut life = Life::new(cols, rows, trail_len(cfg), rule);
+        life.set_grid(cfg.grid);
         life.set_colonies(colony_count(cfg), cfg.colony_mutation);
         life.set_decay(cfg.decay_after, cfg.decay_chance);
         life.seed_rng(rng.gen());
@@ -330,8 +384,10 @@ impl Sim {
             ripple: None,
             next_clock_stamp: now,
             clock_min: None,
-            last_beat: None,
+            spark: VecDeque::new(),
+            next_spark: now,
             guns: Vec::new(),
+            guns_off: false,
             tile: 16,
             tcols: 1,
             tiles: Vec::new(),
@@ -348,10 +404,13 @@ impl Sim {
 
     fn reschedule(&mut self, now: Instant, cfg: &Config) {
         self.next_soft_reset = now + Duration::from_secs(cfg.soft_reset_secs);
-        self.next_glider = now + secs_between(&mut self.rng, cfg.glider_min_secs, cfg.glider_max_secs);
-        self.next_special = now + secs_between(&mut self.rng, cfg.special_min_secs, cfg.special_max_secs);
+        self.next_glider =
+            now + secs_between(&mut self.rng, cfg.glider_min_secs, cfg.glider_max_secs);
+        self.next_special =
+            now + secs_between(&mut self.rng, cfg.special_min_secs, cfg.special_max_secs);
         self.next_stamp = now + secs_between(&mut self.rng, cfg.stamp_min_secs, cfg.stamp_max_secs);
-        self.next_traffic = now + secs_between(&mut self.rng, cfg.traffic_min_secs, cfg.traffic_max_secs);
+        self.next_traffic =
+            now + secs_between(&mut self.rng, cfg.traffic_min_secs, cfg.traffic_max_secs);
         self.next_shift = now + self.shift_gap(cfg);
         self.next_clock_stamp = now + self.clock_gap(cfg);
         self.next_local = now;
@@ -399,15 +458,27 @@ impl Sim {
     pub fn reconfigure(&mut self, now: Instant, cfg: &Config) {
         self.end_shift();
         self.life.set_trail_len(trail_len(cfg));
-        if self.life.set_colonies(colony_count(cfg), cfg.colony_mutation) {
+        if self
+            .life
+            .set_colonies(colony_count(cfg), cfg.colony_mutation)
+        {
             self.life.scatter_colonies(&mut self.rng);
         }
         self.life.set_decay(cfg.decay_after, cfg.decay_chance);
+        let regrid = cfg.grid != self.life.grid();
+        if regrid {
+            self.life.set_grid(cfg.grid);
+            self.spark.clear();
+        }
         if let RuleSel::Fixed(r) = cfg.rule {
             if r != self.life.rule() {
                 self.life.set_rule(r);
                 self.reseed(cfg);
+            } else if regrid {
+                self.reseed(cfg);
             }
+        } else if regrid {
+            self.reseed(cfg);
         }
         self.rebuild_tiles(cfg);
         self.reschedule(now, cfg);
@@ -480,12 +551,27 @@ impl Sim {
         } else {
             0
         };
-        let dt = now.saturating_duration_since(self.last_tick).as_secs_f64().min(1.0);
+        let dt = now
+            .saturating_duration_since(self.last_tick)
+            .as_secs_f64()
+            .min(1.0);
         self.last_tick = now;
+
+        if cfg.overlay && cfg.overlay_sparkline && now >= self.next_spark {
+            self.next_spark = now + Duration::from_secs(1);
+            if self.spark.len() >= SPARK_LEN {
+                self.spark.pop_front();
+            }
+            self.spark.push_back(self.life.census());
+        }
 
         self.update_rule_shift(now, cfg);
 
-        let steps = if cfg.fastforward && self.ff { cfg.fastforward_speed.max(1) } else { 1 };
+        let steps = if cfg.fastforward && self.ff {
+            cfg.fastforward_speed.max(1)
+        } else {
+            1
+        };
         self.steps = steps;
         for _ in 0..steps {
             self.advance_ripple(now, cfg);
@@ -512,7 +598,12 @@ impl Sim {
         }
 
         // 2. System-driven sparks: the busier the CPU, the more often.
-        if cfg.sysload && load > 0.5 && self.rng.gen_bool(((load - 0.5) * 0.6).clamp(0.0, 1.0) as f64) {
+        if cfg.sysload
+            && load > 0.5
+            && self
+                .rng
+                .gen_bool(((load - 0.5) * 0.6).clamp(0.0, 1.0) as f64)
+        {
             self.life.spark(&mut self.rng);
         }
 
@@ -539,7 +630,8 @@ impl Sim {
                     self.life.spark(&mut self.rng);
                 }
             }
-            self.next_glider = now + secs_between(&mut self.rng, cfg.glider_min_secs, cfg.glider_max_secs);
+            self.next_glider =
+                now + secs_between(&mut self.rng, cfg.glider_min_secs, cfg.glider_max_secs);
         }
 
         // 4. Specials: ships, pulsar, Gosper gun, methuselah.
@@ -547,7 +639,8 @@ impl Sim {
             if cfg.patterns {
                 self.inject_special(now, cfg);
             }
-            self.next_special = now + secs_between(&mut self.rng, cfg.special_min_secs, cfg.special_max_secs);
+            self.next_special =
+                now + secs_between(&mut self.rng, cfg.special_min_secs, cfg.special_max_secs);
         }
 
         // 4b. Traffic: a convoy of spaceships crossing the board.
@@ -555,7 +648,8 @@ impl Sim {
             if cfg.traffic {
                 self.inject_convoy();
             }
-            self.next_traffic = now + secs_between(&mut self.rng, cfg.traffic_min_secs, cfg.traffic_max_secs);
+            self.next_traffic =
+                now + secs_between(&mut self.rng, cfg.traffic_min_secs, cfg.traffic_max_secs);
         }
 
         // 5. Stamps: Tux, Arch logo, terminal text.
@@ -563,7 +657,8 @@ impl Sim {
             if cfg.stamps {
                 self.inject_stamp();
             }
-            self.next_stamp = now + secs_between(&mut self.rng, cfg.stamp_min_secs, cfg.stamp_max_secs);
+            self.next_stamp =
+                now + secs_between(&mut self.rng, cfg.stamp_min_secs, cfg.stamp_max_secs);
         }
 
         // 5b. The clock: a stamp that spells the time.
@@ -583,7 +678,10 @@ impl Sim {
             self.census_acc = 0;
             let total = (self.life.cols() * self.life.rows()) as f64;
             let (live, settled) = self.life.census();
-            if self.erase.is_empty() && cfg.clutter_pct > 0.0 && settled as f64 * 100.0 >= total * cfg.clutter_pct {
+            if self.erase.is_empty()
+                && cfg.clutter_pct > 0.0
+                && settled as f64 * 100.0 >= total * cfg.clutter_pct
+            {
                 self.prune();
             }
             let active = (live - settled) as f64;
@@ -592,7 +690,10 @@ impl Sim {
             } else {
                 self.calm_since = None;
             }
-            self.ff = cfg.fastforward && self.calm_since.is_some_and(|s| now.duration_since(s) >= FF_AFTER);
+            self.ff = cfg.fastforward
+                && self
+                    .calm_since
+                    .is_some_and(|s| now.duration_since(s) >= FF_AFTER);
             self.local_calm(now, cfg);
         }
         if let Some(since) = self.calm_since {
@@ -641,13 +742,23 @@ impl Sim {
         if !base.supports_ships() {
             return;
         }
-        let alts: Vec<Rule> = SHIFT_RULES.iter().filter_map(|r| Rule::parse(r)).filter(|&r| r != base).collect();
-        let Some(&alt) = alts.choose(&mut self.rng) else { return };
+        let alts: Vec<Rule> = cfg
+            .rule_shift_rules
+            .iter()
+            .copied()
+            .filter(|&r| r != base)
+            .collect();
+        let Some(&alt) = alts.choose(&mut self.rng) else {
+            return;
+        };
         if cfg.rule_shift_mode == ShiftMode::Ripple && self.begin_ripple(alt, cfg) {
             return;
         }
         self.life.set_rule(alt);
-        self.shift = Some(Shift { restore: base, until_gen: self.gen + cfg.rule_shift_gens as u64 });
+        self.shift = Some(Shift {
+            restore: base,
+            until_gen: self.gen + cfg.rule_shift_gens as u64,
+        });
     }
 
     /// Start a ripple from a random tile. False if the board has a single tile.
@@ -657,25 +768,40 @@ impl Sim {
             return false;
         }
         let trows = n / self.tcols;
-        let (ox, oy) = (self.rng.gen_range(0..self.tcols), self.rng.gen_range(0..trows));
+        let (ox, oy) = (
+            self.rng.gen_range(0..self.tcols),
+            self.rng.gen_range(0..trows),
+        );
         // distance in tiles, the short way round (the board wraps)
         let wrap = |a: usize, b: usize, len: usize| a.abs_diff(b).min(len - a.abs_diff(b));
         let ring: Vec<u32> = (0..n)
             .map(|t| {
-                let (dx, dy) = (wrap(t % self.tcols, ox, self.tcols), wrap(t / self.tcols, oy, trows));
+                let (dx, dy) = (
+                    wrap(t % self.tcols, ox, self.tcols),
+                    wrap(t / self.tcols, oy, trows),
+                );
                 ((dx * dx + dy * dy) as f64).sqrt().round() as u32
             })
             .collect();
         let (hold, stagger) = (cfg.rule_shift_gens as u64, cfg.rule_shift_stagger as u64);
         let last = ring.iter().copied().max().unwrap_or(0) as u64;
-        self.ripple = Some(Ripple { ring, on: vec![false; n], start: self.gen, hold, stagger, end: self.gen + last * stagger + hold });
+        self.ripple = Some(Ripple {
+            ring,
+            on: vec![false; n],
+            start: self.gen,
+            hold,
+            stagger,
+            end: self.gen + last * stagger + hold,
+        });
         true
     }
 
     /// Before each generation: switch tiles over to / back from the
     /// alternative rule according to how far the ripple has travelled.
     fn advance_ripple(&mut self, now: Instant, cfg: &Config) {
-        let Some(mut r) = self.ripple.take() else { return };
+        let Some(mut r) = self.ripple.take() else {
+            return;
+        };
         if self.gen >= r.end {
             self.life.end_alt();
             self.next_shift = now + self.shift_gap(cfg);
@@ -700,7 +826,8 @@ impl Sim {
         if cfg.local_calm_secs == 0 || self.tiles.is_empty() {
             return;
         }
-        self.life.tile_activity(self.tile, self.tcols, &mut self.tact);
+        self.life
+            .tile_activity(self.tile, self.tcols, &mut self.tact);
         let allow = ((self.tile * self.tile) / 128).max(1) as u32;
         let calm_for = Duration::from_secs(cfg.local_calm_secs);
         let mut eligible = Vec::new();
@@ -724,7 +851,8 @@ impl Sim {
         let t = eligible[self.rng.gen_range(0..eligible.len())];
         self.inject_in_tile(t, cfg);
         self.tiles[t] = None; // its clock starts over
-        self.next_local = now + Duration::from_secs_f64((cfg.local_calm_secs as f64 / 3.0).max(1.0));
+        self.next_local =
+            now + Duration::from_secs_f64((cfg.local_calm_secs as f64 / 3.0).max(1.0));
     }
 
     /// Something new in tile `t`: mostly a soup patch (sometimes symmetric), or
@@ -733,7 +861,10 @@ impl Sim {
         let (cols, rows) = (self.life.cols(), self.life.rows());
         let (tx, ty) = (t % self.tcols, t / self.tcols);
         let (x0, y0) = (tx * self.tile, ty * self.tile);
-        let (cx, cy) = ((x0 + self.tile / 2).min(cols - 1), (y0 + self.tile / 2).min(rows - 1));
+        let (cx, cy) = (
+            (x0 + self.tile / 2).min(cols - 1),
+            (y0 + self.tile / 2).min(rows - 1),
+        );
         let ships = self.life.rule().supports_ships();
         let roll = self.rng.gen_range(0..100);
         if ships && roll >= 85 && self.inject_methuselah(cx, cy) {
@@ -756,8 +887,19 @@ impl Sim {
         self.queue_soup(px, py, pw, ph, density, sym, colony);
     }
 
-    fn queue_soup(&mut self, x: usize, y: usize, w: usize, h: usize, density: f64, sym: Sym, colony: u8) {
-        let cells = self.life.soup_cells_sym(&mut self.rng, x, y, w, h, density, sym);
+    fn queue_soup(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        density: f64,
+        sym: Sym,
+        colony: u8,
+    ) {
+        let cells = self
+            .life
+            .soup_cells_sym(&mut self.rng, x, y, w, h, density, sym);
         self.spawn.extend(cells.into_iter().map(|i| (i, colony)));
         self.spawn.shuffle(&mut self.rng);
         self.spawn_ticks = self.spawn_ticks.max(DRIP_TICKS);
@@ -768,8 +910,16 @@ impl Sim {
         if !self.life.rule().supports_ships() {
             return false;
         }
-        let base = if self.rng.gen_bool(0.6) { patterns::r_pentomino() } else { patterns::acorn() };
-        let pat = base.transformed(self.rng.gen_bool(0.5), self.rng.gen_bool(0.5), self.rng.gen_bool(0.5));
+        let base = if self.rng.gen_bool(0.6) {
+            patterns::r_pentomino()
+        } else {
+            patterns::acorn()
+        };
+        let pat = base.transformed(
+            self.rng.gen_bool(0.5),
+            self.rng.gen_bool(0.5),
+            self.rng.gen_bool(0.5),
+        );
         let (cols, rows) = (self.life.cols(), self.life.rows());
         if pat.w + 4 > cols || pat.h + 4 > rows {
             return false;
@@ -866,7 +1016,12 @@ impl Sim {
     /// Adopt a saved board. False (nothing changed) if the board is empty or
     /// was saved under a rule the config doesn't allow.
     pub fn restore(&mut self, saved: &Saved, cfg: &Config) -> bool {
-        let Some(rule) = crate::life::Rule::parse(&saved.rule) else { return false };
+        let Some(rule) = crate::life::Rule::parse(&saved.rule) else {
+            return false;
+        };
+        if saved.grid != self.life.grid() {
+            return false; // a hex board is not a square one
+        }
         if saved.cells.iter().all(|&c| c == 0) {
             return false;
         }
@@ -912,7 +1067,7 @@ impl Sim {
                 let p = patterns::pulsar();
                 self.life.place_random(&mut self.rng, &p, 2, 1);
             }
-            2 => {
+            2 if !self.guns_off => {
                 if let Some((x, y, w, h)) = self.life.place_gun(&mut self.rng) {
                     if cfg.gun_secs > 0 {
                         let expire = now + Duration::from_secs(cfg.gun_secs);
@@ -961,7 +1116,9 @@ impl Sim {
     /// A stamp that spells the local time as HH:MM (24 hour). False if the
     /// time is unknown or the board is too small for it.
     fn inject_clock_stamp(&mut self) -> bool {
-        let Some(m) = self.clock_min else { return false };
+        let Some(m) = self.clock_min else {
+            return false;
+        };
         let pat = patterns::text(&Font::build(), &format!("{:02}:{:02}", m / 60 % 24, m % 60));
         let c = self.fresh_colony();
         self.life.set_brush(c);
@@ -971,19 +1128,43 @@ impl Sim {
     /// A beat from the audio meter: a glider (two on a hard beat) from an
     /// edge. Rate limited, and held back while the board is crowded.
     pub fn on_beat(&mut self, strength: f32, now: Instant) {
-        if self.last_beat.is_some_and(|t| now.duration_since(t) < BEAT_COOLDOWN) {
+        if self
+            .last_event
+            .is_some_and(|t| now.duration_since(t) < BEAT_COOLDOWN)
+        {
             return;
         }
         let total = (self.life.cols() * self.life.rows()) as f64;
         if self.life.population() as f64 > total * BEAT_MAX_FILL {
             return;
         }
-        self.last_beat = Some(now);
+        self.last_event = Some(now);
         for _ in 0..if strength > 0.6 { 2 } else { 1 } {
             let c = self.fresh_colony();
             self.life.set_brush(c);
             if self.life.rule().supports_ships() {
-                self.life.place_ship_on_edge(&mut self.rng, true, false);
+                let before = self.life.population();
+                let snapshot = self.life.cells().to_vec();
+                let mut placed = false;
+                for _ in 0..8 {
+                    self.life.place_ship_on_edge(&mut self.rng, true, false);
+                    if self.life.population() == before + 5 {
+                        placed = true;
+                        break;
+                    }
+                    // Revert colliding attempt and retry.
+                    let _ = &snapshot;
+                    self.life.clear();
+                    for (idx, &v) in snapshot.iter().enumerate() {
+                        if v == 1 {
+                            self.life.set_alive(idx);
+                        }
+                    }
+                    self.life.set_brush(c);
+                }
+                if !placed {
+                    self.life.place_ship_on_edge(&mut self.rng, true, false);
+                }
             } else {
                 self.life.spark(&mut self.rng);
             }
@@ -993,7 +1174,11 @@ impl Sim {
     /// React to a Hyprland event: a workspace switch sends gliders across, a
     /// new window sparks a soup patch, a closed window leaves a symmetric bloom.
     pub fn on_event(&mut self, ev: HyprEvent, now: Instant, cfg: &Config) {
-        if self.last_event.is_some_and(|t| now.duration_since(t) < EVENT_COOLDOWN) || self.spawn.len() > MAX_QUEUED {
+        if self
+            .last_event
+            .is_some_and(|t| now.duration_since(t) < EVENT_COOLDOWN)
+            || self.spawn.len() > MAX_QUEUED
+        {
             return;
         }
         self.last_event = Some(now);
@@ -1011,10 +1196,20 @@ impl Sim {
                 }
             }
             HyprEvent::OpenWindow | HyprEvent::CloseWindow => {
-                let (pw, ph) = ((cols / 6).clamp(4, 24).min(cols), (rows / 6).clamp(4, 16).min(rows));
+                let (pw, ph) = (
+                    (cols / 6).clamp(4, 24).min(cols),
+                    (rows / 6).clamp(4, 16).min(rows),
+                );
                 let (x, y) = self.life.emptiest_spot(&mut self.rng, pw, ph, 24);
                 let (sym, density) = if ev == HyprEvent::CloseWindow {
-                    (if self.rng.gen_bool(0.5) { Sym::Both } else { Sym::Rot }, 0.38)
+                    (
+                        if self.rng.gen_bool(0.5) {
+                            Sym::Both
+                        } else {
+                            Sym::Rot
+                        },
+                        0.38,
+                    )
                 } else {
                     (self.pick_sym(cfg), 0.34)
                 };
@@ -1030,7 +1225,11 @@ impl Sim {
     /// surroundings can be seen); a closed window blooms in the space it
     /// leaves, symmetric, up to `BLOOM_MAX` cells across.
     pub fn on_event_at(&mut self, ev: HyprEvent, spot: Spot, now: Instant, cfg: &Config) {
-        if self.last_event.is_some_and(|t| now.duration_since(t) < LOCATED_COOLDOWN) || self.spawn.len() > MAX_QUEUED {
+        if self
+            .last_event
+            .is_some_and(|t| now.duration_since(t) < LOCATED_COOLDOWN)
+            || self.spawn.len() > MAX_QUEUED
+        {
             return;
         }
         let (cols, rows) = (self.life.cols(), self.life.rows());
@@ -1048,25 +1247,442 @@ impl Sim {
                 let (x1, y1) = ((x + w + HALO).min(cols), (y + h + HALO).min(rows));
                 let sym = self.pick_sym(cfg);
                 let colony = self.fresh_colony();
-                let cells = self.life.soup_cells_sym(&mut self.rng, x0, y0, x1 - x0, y1 - y0, (0.45 * scale).min(0.9), sym);
+                let cells = self.life.soup_cells_sym(
+                    &mut self.rng,
+                    x0,
+                    y0,
+                    x1 - x0,
+                    y1 - y0,
+                    (0.45 * scale).min(0.9),
+                    sym,
+                );
                 let outside = |i: usize| {
                     let (cx, cy) = (i % cols, i / cols);
                     !(cx >= x && cx < x + w && cy >= y && cy < y + h)
                 };
-                self.spawn.extend(cells.into_iter().filter(|&i| outside(i)).map(|i| (i, colony)));
+                self.spawn.extend(
+                    cells
+                        .into_iter()
+                        .filter(|&i| outside(i))
+                        .map(|i| (i, colony)),
+                );
                 self.spawn.shuffle(&mut self.rng);
                 self.spawn_ticks = self.spawn_ticks.max(DRIP_TICKS);
             }
             HyprEvent::CloseWindow => {
                 // centred in the window, at most BLOOM_MAX, at least a small patch
-                let (bw, bh) = (w.clamp(8.min(cols), BLOOM_MAX.0.min(cols)), h.clamp(8.min(rows), BLOOM_MAX.1.min(rows)));
+                let (bw, bh) = (
+                    w.clamp(8.min(cols), BLOOM_MAX.0.min(cols)),
+                    h.clamp(8.min(rows), BLOOM_MAX.1.min(rows)),
+                );
                 let bx = (x + w / 2).saturating_sub(bw / 2).min(cols - bw);
                 let by = (y + h / 2).saturating_sub(bh / 2).min(rows - bh);
-                let sym = if self.rng.gen_bool(0.5) { Sym::Both } else { Sym::Rot };
+                let sym = if self.rng.gen_bool(0.5) {
+                    Sym::Both
+                } else {
+                    Sym::Rot
+                };
                 let colony = self.fresh_colony();
                 self.queue_soup(bx, by, bw, bh, (0.38 * scale).min(0.9), sym, colony);
             }
         }
+    }
+
+    /// A mid-band beat: a small random blob, now and then a methuselah.
+    /// Shares the injection clock and the crowding limit with `on_beat`.
+    pub fn on_spark(&mut self, now: Instant) {
+        if self
+            .last_event
+            .is_some_and(|t| now.duration_since(t) < IPC_COOLDOWN)
+        {
+            return;
+        }
+        let (cols, rows) = (self.life.cols(), self.life.rows());
+        if self.life.population() as f64 > (cols * rows) as f64 * BEAT_MAX_FILL {
+            return;
+        }
+        self.last_event = Some(now);
+        let c = self.fresh_colony();
+        self.life.set_brush(c);
+        if self.rng.gen_bool(0.2) {
+            let (cx, cy) = (self.rng.gen_range(0..cols), self.rng.gen_range(0..rows));
+            if self.inject_methuselah(cx, cy) {
+                return;
+            }
+        }
+        self.life.spark(&mut self.rng);
+    }
+
+    /// A treble beat: two cosmic rays. Only disturbs cells that exist, adds no
+    /// structure, and so does not use the injection clock.
+    pub fn on_noise(&mut self) {
+        for _ in 0..2 {
+            self.life.cosmic_ray(&mut self.rng);
+        }
+    }
+
+    /// A new track started: a symmetric bloom in the colour of the artist's
+    /// bucket (when colonies are on, else a fresh colony).
+    pub fn on_track(&mut self, bucket: Option<usize>, now: Instant) {
+        if !self.gate(now, EVENT_COOLDOWN) {
+            return;
+        }
+        let (cols, rows) = (self.life.cols(), self.life.rows());
+        let (w, h) = (16.min(cols), 16.min(rows));
+        let c = match bucket {
+            Some(b) if self.life.colonies_on() && self.life.ncolonies() > 0 => {
+                (b % self.life.ncolonies()) as u8
+            }
+            _ => self.fresh_colony(),
+        };
+        self.life.set_brush(c);
+        let (x, y) = self.life.emptiest_spot(&mut self.rng, w, h, 24);
+        let sym = SYMMETRIES[self.rng.gen_range(0..SYMMETRIES.len())];
+        let density = (0.35 * self.life.rule().seed_scale()).min(0.9);
+        self.queue_soup(x, y, w, h, density, sym, c);
+    }
+
+    /// Population and settled counts, oldest first, one per second.
+    pub fn sparkline(&self) -> &VecDeque<(usize, usize)> {
+        &self.spark
+    }
+
+    /// A workspace switch: a quick ripple of the alternative rule across the
+    /// board (one tile deep, a few generations), as a transition gesture.
+    /// False if one is already running or the board cannot ripple.
+    pub fn on_workspace_ripple(&mut self, cfg: &Config) -> bool {
+        let base = self.life.rule();
+        if self.ripple.is_some() || self.shift.is_some() || !base.supports_ships() {
+            return false;
+        }
+        let Some(&alt) = cfg.rule_shift_rules.iter().find(|&&r| r != base) else {
+            return false;
+        };
+        let quick = Config {
+            rule_shift_gens: 3,
+            rule_shift_stagger: 1,
+            ..cfg.clone()
+        };
+        self.begin_ripple(alt, &quick)
+    }
+
+    /// Sustained loud bass: a pulsar blooms somewhere with room.
+    pub fn on_bloom(&mut self, now: Instant) -> bool {
+        if !self.gate(now, BEAT_COOLDOWN) {
+            return false;
+        }
+        let c = self.fresh_colony();
+        self.life.set_brush(c);
+        self.life
+            .place_random(&mut self.rng, &patterns::pulsar(), 3, 2)
+    }
+
+    /// Snow: a few cells appear along the top edge.
+    pub fn on_snow(&mut self) {
+        let cols = self.life.cols();
+        let c = self.fresh_colony();
+        self.life.set_brush(c);
+        for _ in 0..3 {
+            let x = self.rng.gen_range(0..cols);
+            self.life.set_alive(x);
+        }
+    }
+
+    /// The pointer is over cell (cx, cy) (it was over `prev` a moment ago).
+    /// Adds cells according to `mode`; nothing if the board is already crowded.
+    pub fn on_cursor(
+        &mut self,
+        mode: CursorMode,
+        prev: Option<(usize, usize)>,
+        at: (usize, usize),
+        radius: usize,
+    ) {
+        let (cols, rows) = (self.life.cols(), self.life.rows());
+        if cols == 0
+            || rows == 0
+            || self.life.population() as f64 > (cols * rows) as f64 * BEAT_MAX_FILL
+        {
+            return;
+        }
+        let (cx, cy) = (at.0.min(cols - 1) as i64, at.1.min(rows - 1) as i64);
+        let r = radius.max(1) as i64;
+        let c = self.fresh_colony();
+        self.life.set_brush(c);
+        let put = |life: &mut Life, x: i64, y: i64| {
+            if x >= 0 && y >= 0 && (x as usize) < cols && (y as usize) < rows {
+                life.set_alive(y as usize * cols + x as usize);
+            }
+        };
+        match mode {
+            CursorMode::Trail => {
+                let (px, py) = prev.map_or((cx, cy), |(x, y)| {
+                    (x.min(cols - 1) as i64, y.min(rows - 1) as i64)
+                });
+                let steps = (cx - px).abs().max((cy - py).abs()).clamp(1, 64);
+                for k in 0..=steps {
+                    let (x, y) = (px + (cx - px) * k / steps, py + (cy - py) * k / steps);
+                    for dy in -(r - 1)..=(r - 1) {
+                        for dx in -(r - 1)..=(r - 1) {
+                            if dx.abs() + dy.abs() < r {
+                                put(&mut self.life, x + dx, y + dy);
+                            }
+                        }
+                    }
+                }
+            }
+            CursorMode::Sparkle => {
+                for _ in 0..(2 * r) {
+                    let (dx, dy) = (self.rng.gen_range(-r..=r), self.rng.gen_range(-r..=r));
+                    put(&mut self.life, cx + dx, cy + dy);
+                }
+            }
+            CursorMode::Soup => {
+                let w = ((2 * r + 1) as usize).min(cols);
+                let h = ((2 * r + 1) as usize).min(rows);
+                let x = ((cx - r).max(0) as usize).min(cols - w);
+                let y = ((cy - r).max(0) as usize).min(rows - h);
+                let sym = Sym::None;
+                self.queue_soup(x, y, w, h, 0.45, sym, c);
+            }
+        }
+    }
+
+    /// Low-power mode: no Gosper guns.
+    pub fn set_guns_off(&mut self, off: bool) {
+        self.guns_off = off;
+    }
+
+    /// Live cells per colony (empty when colours are not tracked).
+    pub fn colony_counts(&self) -> Vec<usize> {
+        let n = if self.life.colonies_on() {
+            self.life.ncolonies()
+        } else {
+            0
+        };
+        let mut v = vec![0usize; n];
+        if n > 0 {
+            let (cells, colony) = (self.life.cells(), self.life.colony());
+            for i in 0..cells.len() {
+                if cells[i] == 1 {
+                    v[colony[i] as usize % n] += 1;
+                }
+            }
+        }
+        v
+    }
+
+    /// Check and take the shared injection clock.
+    fn gate(&mut self, now: Instant, cooldown: Duration) -> bool {
+        if self
+            .last_event
+            .is_some_and(|t| now.duration_since(t) < cooldown)
+        {
+            return false;
+        }
+        self.last_event = Some(now);
+        true
+    }
+
+    fn take_gate(&mut self, now: Instant, gated: bool) -> Result<(), String> {
+        if gated && !self.gate(now, IPC_COOLDOWN) {
+            return Err("busy: something was injected a moment ago, try again".into());
+        }
+        Ok(())
+    }
+
+    /// Place `pat` at (x, y) (top-left), or at a random spot with `margin`
+    /// free cells to the border. Returns where it went (0, 0 for random).
+    fn place_pattern(
+        &mut self,
+        pat: &patterns::Pattern,
+        at: Option<(usize, usize)>,
+        margin: usize,
+        clear: usize,
+    ) -> Result<(usize, usize), String> {
+        let (cols, rows) = (self.life.cols(), self.life.rows());
+        if pat.w > cols || pat.h > rows {
+            return Err(format!(
+                "a {}x{} pattern does not fit the {cols}x{rows} board",
+                pat.w, pat.h
+            ));
+        }
+        match at {
+            Some((x, y)) => {
+                if x + pat.w > cols || y + pat.h > rows {
+                    return Err(format!(
+                        "{}x{} at {x},{y} runs off the {cols}x{rows} board",
+                        pat.w, pat.h
+                    ));
+                }
+                self.life.place(pat, x, y, clear);
+                Ok((x, y))
+            }
+            None => {
+                if !self.life.place_random(&mut self.rng, pat, margin, clear) {
+                    return Err("no room for it on this board".into());
+                }
+                Ok((0, 0))
+            }
+        }
+    }
+
+    /// Put a named pattern on the board (control socket, `--inject`).
+    /// `name` is one of `patterns::NAMES`, `soup`, `convoy`, `methuselah`,
+    /// `clock`, or `text=WORDS`. `at` is the top-left cell; `edge` picks the
+    /// side a ship enters from. `gated` shares the injection clock with beats
+    /// and Hyprland events (so a flood is refused); `--once` passes false.
+    pub fn inject(
+        &mut self,
+        name: &str,
+        at: Option<(usize, usize)>,
+        edge: Option<Edge>,
+        cfg: &Config,
+        now: Instant,
+        gated: bool,
+    ) -> Result<String, String> {
+        if let Some(text) = name.strip_prefix("text=") {
+            return self.inject_text(text, at, now, gated);
+        }
+        let key = name.to_ascii_lowercase().replace('_', "-");
+        let special = matches!(key.as_str(), "soup" | "convoy" | "methuselah" | "clock");
+        if !special && patterns::by_name(&key).is_none() {
+            return Err(format!(
+                "unknown pattern {name:?} (try {}, soup, convoy, methuselah, clock, text=WORDS)",
+                patterns::NAMES.join(", ")
+            ));
+        }
+        let (cols, rows) = (self.life.cols(), self.life.rows());
+        if let Some((x, y)) = at {
+            if x >= cols || y >= rows {
+                return Err(format!("{x},{y} is outside the {cols}x{rows} board"));
+            }
+        }
+        self.take_gate(now, gated)?;
+        let c = self.fresh_colony();
+        self.life.set_brush(c);
+        match key.as_str() {
+            "soup" => {
+                let (w, h) = (16.min(cols), 16.min(rows));
+                let (x, y) = match at {
+                    Some((x, y)) => (x.min(cols - w), y.min(rows - h)),
+                    None => self.life.emptiest_spot(&mut self.rng, w, h, 24),
+                };
+                let sym = self.pick_sym(cfg);
+                let density = (0.35 * self.life.rule().seed_scale()).min(0.9);
+                self.queue_soup(x, y, w, h, density, sym, c);
+            }
+            "convoy" => {
+                if !self.life.rule().supports_ships() {
+                    return Err("this rule has no spaceships".into());
+                }
+                self.inject_convoy();
+            }
+            "methuselah" => {
+                let (cx, cy) = at
+                    .unwrap_or_else(|| (self.rng.gen_range(0..cols), self.rng.gen_range(0..rows)));
+                if !self.inject_methuselah(cx, cy) {
+                    return Err("this rule or board cannot take a methuselah".into());
+                }
+            }
+            "clock" => {
+                if !self.inject_clock_stamp() {
+                    return Err("the time is unknown or the board is too small".into());
+                }
+            }
+            "gun" | "gosper-gun" | "gosper" => {
+                let placed = match at {
+                    Some(_) => {
+                        let pat = patterns::gosper_gun();
+                        let (x, y) = self.place_pattern(&pat, at, 0, 2)?;
+                        Some((x, y, pat.w, pat.h))
+                    }
+                    None => self.life.place_gun(&mut self.rng),
+                };
+                let Some((x, y, w, h)) = placed else {
+                    return Err("no room for a gun".into());
+                };
+                if cfg.gun_secs > 0 {
+                    self.guns.push(Gun {
+                        x,
+                        y,
+                        w,
+                        h,
+                        expire: now + Duration::from_secs(cfg.gun_secs),
+                    });
+                }
+            }
+            "glider" | "lwss" | "mwss" | "hwss" if at.is_none() => {
+                let ok = match (key.as_str(), edge) {
+                    ("glider", Some(e)) => self.life.place_glider_at_edge(&mut self.rng, e.index()),
+                    ("glider", None) => self.life.place_ship_on_edge(&mut self.rng, true, false),
+                    (_, e) => {
+                        let ship = patterns::by_name(&key).unwrap_or_else(patterns::lwss);
+                        match e {
+                            Some(e) => {
+                                self.life
+                                    .place_east_ship_at_edge(&mut self.rng, &ship, e.index())
+                            }
+                            None => self.life.place_east_ship_on_edge(&mut self.rng, &ship),
+                        }
+                    }
+                };
+                if !ok {
+                    return Err("the board is too small for it".into());
+                }
+            }
+            _ => {
+                let pat =
+                    patterns::by_name(&key).ok_or_else(|| format!("unknown pattern {name:?}"))?;
+                self.place_pattern(&pat, at, 3, 2)?;
+            }
+        }
+        Ok(format!("injected {key}"))
+    }
+
+    /// Spell `text` on the board (5x7 font, upper and lower case).
+    pub fn inject_text(
+        &mut self,
+        text: &str,
+        at: Option<(usize, usize)>,
+        now: Instant,
+        gated: bool,
+    ) -> Result<String, String> {
+        if text.is_empty() || text.len() > 64 {
+            return Err("text must be 1 to 64 characters".into());
+        }
+        self.take_gate(now, gated)?;
+        let pat = patterns::text(&Font::build(), text);
+        let c = self.fresh_colony();
+        self.life.set_brush(c);
+        self.place_pattern(&pat, at, 3, 2)?;
+        Ok(format!("injected text {text:?}"))
+    }
+
+    /// Adopt a named scene: like `restore`, but the saved rule wins over the
+    /// configured one (until the next config reload reseeds the board).
+    pub fn load_scene(&mut self, saved: &Saved) -> Result<(), String> {
+        let rule = crate::life::Rule::parse(&saved.rule)
+            .ok_or_else(|| format!("scene has an unknown rule {:?}", saved.rule))?;
+        if saved.grid != self.life.grid() {
+            return Err(format!(
+                "the scene was saved on a {} grid, this board is {}",
+                saved.grid.name(),
+                self.life.grid().name()
+            ));
+        }
+        self.end_shift();
+        self.life.set_rule(rule);
+        self.life.load(saved);
+        if self.life.colonies_on() && saved.colony.is_empty() {
+            self.life.scatter_colonies(&mut self.rng);
+        }
+        if let Some(i) = ROTATION.iter().position(|&r| r == rule) {
+            self.rule_idx = i;
+        }
+        self.guns.clear();
+        self.clear_queues();
+        self.reset_stagnation();
+        Ok(())
     }
 
     /// Clear + random soup at the reseed density; rotate rules if asked to.
@@ -1080,7 +1696,10 @@ impl Sim {
             }
         };
         self.life.set_rule(rule);
-        self.life.seed(&mut self.rng, (cfg.reseed_density * rule.seed_scale()).min(0.9));
+        self.life.seed(
+            &mut self.rng,
+            (cfg.reseed_density * rule.seed_scale()).min(0.9),
+        );
         self.gen = 0;
         self.guns.clear();
         self.clear_queues();
@@ -1179,12 +1798,20 @@ mod tests {
         assert!(s.life.population() > 20, "never injected");
         assert_eq!(s.gen, ticks, "board was reset instead of added to");
         // the patch arrives over several generations, not in one pop
-        assert!(seen.len() >= 2 && seen[0] < 20, "population jumped: {seen:?}");
+        assert!(
+            seen.len() >= 2 && seen[0] < 20,
+            "population jumped: {seen:?}"
+        );
     }
 
     #[test]
     fn no_timed_reset_by_default() {
-        let cfg = Config { calm_pct: 0.0, clutter_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let cfg = Config {
+            calm_pct: 0.0,
+            clutter_pct: 0.0,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         let mut now = t0;
@@ -1206,7 +1833,10 @@ mod tests {
 
     #[test]
     fn clutter_prunes_settled_shapes_without_resetting() {
-        let cfg = Config { clutter_pct: 5.0, ..quiet_cfg() };
+        let cfg = Config {
+            clutter_pct: 5.0,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         s.life.clear();
@@ -1219,13 +1849,21 @@ mod tests {
         assert_eq!(s.gen, 200, "board was reset");
         let (_, settled) = s.life.census();
         assert!(settled > 0, "everything was wiped");
-        assert!((settled as f64) * 100.0 / 1200.0 < 5.0, "still cluttered: {settled}");
+        assert!(
+            (settled as f64) * 100.0 / 1200.0 < 5.0,
+            "still cluttered: {settled}"
+        );
         assert_eq!(settled % 4, 0, "shapes should be removed whole");
     }
 
     #[test]
     fn pruned_cells_leave_death_trails() {
-        let cfg = Config { clutter_pct: 5.0, trail: true, trail_length: 4, ..quiet_cfg() };
+        let cfg = Config {
+            clutter_pct: 5.0,
+            trail: true,
+            trail_length: 4,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         s.life.clear();
@@ -1242,7 +1880,12 @@ mod tests {
 
     #[test]
     fn sparse_settled_shapes_are_left_alone() {
-        let cfg = Config { clutter_pct: 5.0, calm_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let cfg = Config {
+            clutter_pct: 5.0,
+            calm_pct: 0.0,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         s.life.clear();
@@ -1265,23 +1908,40 @@ mod tests {
         let mut a = Sim::new(30, 20, Instant::now(), &cfg);
         a.life.clear();
         a.life.place(&Pattern::from_art(&["###"]), 4, 4, 0);
-        let saved = Saved { cols: 30, rows: 20, rule: a.life.rule().name(), cells: a.life.cells().to_vec(), age: a.life.age().to_vec(), colony: a.life.colony().to_vec() };
+        let saved = Saved {
+            cols: 30,
+            rows: 20,
+            rule: a.life.rule().name(),
+            cells: a.life.cells().to_vec(),
+            age: a.life.age().to_vec(),
+            colony: a.life.colony().to_vec(),
+            grid: Grid::Square,
+        };
 
         let mut b = Sim::new(30, 20, Instant::now(), &cfg);
         assert!(b.restore(&saved, &cfg));
         assert_eq!(b.life.cells(), a.life.cells());
 
-        let other = Config { rule: RuleSel::Fixed(crate::life::SEEDS), ..Config::default() };
+        let other = Config {
+            rule: RuleSel::Fixed(crate::life::SEEDS),
+            ..Config::default()
+        };
         let mut c = Sim::new(30, 20, Instant::now(), &other);
         assert!(!c.restore(&saved, &other)); // saved under life, config wants seeds
 
-        let empty = Saved { cells: vec![0; 600], ..saved };
+        let empty = Saved {
+            cells: vec![0; 600],
+            ..saved
+        };
         assert!(!b.restore(&empty, &cfg));
     }
 
     #[test]
     fn rotate_cycles_rules_on_reseed() {
-        let cfg = Config { rule: RuleSel::Rotate, ..Config::default() };
+        let cfg = Config {
+            rule: RuleSel::Rotate,
+            ..Config::default()
+        };
         let mut s = Sim::new(30, 30, Instant::now(), &cfg);
         let mut seen = vec![s.rule()];
         for _ in 0..4 {
@@ -1337,7 +1997,12 @@ mod tests {
 
     #[test]
     fn a_quiet_tile_gets_a_local_patch_without_a_reset() {
-        let cfg = Config { local_calm_secs: 4, calm_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let cfg = Config {
+            local_calm_secs: 4,
+            calm_pct: 0.0,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(96, 64, t0, &cfg);
         s.life.clear();
@@ -1361,7 +2026,12 @@ mod tests {
 
     #[test]
     fn a_busy_tile_is_left_alone_while_quiet_ones_get_help() {
-        let cfg = Config { local_calm_secs: 3, calm_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let cfg = Config {
+            local_calm_secs: 3,
+            calm_pct: 0.0,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(64, 64, t0, &cfg);
         s.life.clear();
@@ -1373,24 +2043,39 @@ mod tests {
         // quiet tiles far from the gun are on their own clocks and eventually get life
         let before = s.life.count_in(0, 40, 64, 24);
         run(&mut s, &cfg, now, 200);
-        assert!(s.life.count_in(0, 40, 64, 24) > before || s.life.population() > 100, "quiet tiles never got life");
+        assert!(
+            s.life.count_in(0, 40, 64, 24) > before || s.life.population() > 100,
+            "quiet tiles never got life"
+        );
     }
 
     #[test]
     fn cosmic_rays_keep_disturbing_a_frozen_board() {
-        let cfg = Config { noise_per_sec: 40.0, ..quiet_cfg() };
+        let cfg = Config {
+            noise_per_sec: 40.0,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         s.life.clear();
         block_lattice(&mut s);
         let pop0 = s.life.population();
         run(&mut s, &cfg, t0, 40);
-        assert_ne!(s.life.population(), pop0, "40 rays per second must change a frozen lattice");
+        assert_ne!(
+            s.life.population(),
+            pop0,
+            "40 rays per second must change a frozen lattice"
+        );
     }
 
     #[test]
     fn rule_shift_swaps_for_a_while_and_always_returns() {
-        let cfg = Config { rule_shift_secs: 2, rule_shift_gens: 5, rule_shift_mode: ShiftMode::Global, ..quiet_cfg() };
+        let cfg = Config {
+            rule_shift_secs: 2,
+            rule_shift_gens: 5,
+            rule_shift_mode: ShiftMode::Global,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         let base = s.rule();
@@ -1413,7 +2098,11 @@ mod tests {
 
     #[test]
     fn rule_shift_is_not_used_on_rules_without_ships() {
-        let cfg = Config { rule_shift_secs: 1, rule: RuleSel::Fixed(crate::life::SEEDS), ..quiet_cfg() };
+        let cfg = Config {
+            rule_shift_secs: 1,
+            rule: RuleSel::Fixed(crate::life::SEEDS),
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         let mut now = t0;
@@ -1426,7 +2115,13 @@ mod tests {
 
     #[test]
     fn calm_board_fast_forwards_and_slows_down_when_life_returns() {
-        let cfg = Config { fastforward: true, fastforward_speed: 4, calm_pct: 0.3, stagnation_secs: 86_400, ..quiet_cfg() };
+        let cfg = Config {
+            fastforward: true,
+            fastforward_speed: 4,
+            calm_pct: 0.3,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(60, 40, t0, &cfg);
         s.life.clear();
@@ -1446,7 +2141,11 @@ mod tests {
 
     #[test]
     fn fast_forward_off_means_one_generation_per_tick() {
-        let cfg = Config { fastforward: false, stagnation_secs: 86_400, ..quiet_cfg() };
+        let cfg = Config {
+            fastforward: false,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(60, 40, t0, &cfg);
         s.life.clear();
@@ -1456,7 +2155,10 @@ mod tests {
 
     #[test]
     fn guns_are_taken_down_after_gun_secs() {
-        let cfg = Config { gun_secs: 2, ..quiet_cfg() };
+        let cfg = Config {
+            gun_secs: 2,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(120, 80, t0, &cfg);
         s.life.clear();
@@ -1482,7 +2184,10 @@ mod tests {
 
     #[test]
     fn permanent_guns_when_gun_secs_is_zero() {
-        let cfg = Config { gun_secs: 0, ..quiet_cfg() };
+        let cfg = Config {
+            gun_secs: 0,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(120, 80, t0, &cfg);
         for _ in 0..300 {
@@ -1498,10 +2203,18 @@ mod tests {
         let mut s = Sim::new(120, 80, t0, &cfg);
         s.life.clear();
         s.on_event(HyprEvent::Workspace, t0, &cfg);
-        assert!(s.life.population() >= 5, "at least one glider: {}", s.life.population());
+        assert!(
+            s.life.population() >= 5,
+            "at least one glider: {}",
+            s.life.population()
+        );
         let pop = s.life.population();
         s.on_event(HyprEvent::Workspace, t0 + Duration::from_millis(100), &cfg);
-        assert_eq!(s.life.population(), pop, "second event inside the cooldown is ignored");
+        assert_eq!(
+            s.life.population(),
+            pop,
+            "second event inside the cooldown is ignored"
+        );
         s.on_event(HyprEvent::OpenWindow, t0 + Duration::from_secs(1), &cfg);
         assert!(!s.spawn.is_empty(), "a new window queues a soup patch");
         s.spawn.clear();
@@ -1511,7 +2224,10 @@ mod tests {
 
     #[test]
     fn convoys_and_methuselahs_need_a_ship_rule() {
-        let cfg = Config { rule: RuleSel::Fixed(crate::life::SEEDS), ..quiet_cfg() };
+        let cfg = Config {
+            rule: RuleSel::Fixed(crate::life::SEEDS),
+            ..quiet_cfg()
+        };
         let mut s = Sim::new(120, 80, Instant::now(), &cfg);
         s.life.clear();
         s.inject_convoy();
@@ -1521,12 +2237,19 @@ mod tests {
         let mut s = Sim::new(120, 80, Instant::now(), &cfg);
         s.life.clear();
         s.inject_convoy();
-        assert!(s.life.population() >= 18, "at least two ships, got {}", s.life.population());
+        assert!(
+            s.life.population() >= 18,
+            "at least two ships, got {}",
+            s.life.population()
+        );
     }
 
     #[test]
     fn colonies_spread_and_mix_on_a_running_board() {
-        let cfg = Config { colonies: true, ..quiet_cfg() };
+        let cfg = Config {
+            colonies: true,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(120, 80, t0, &cfg);
         assert!(s.life.colonies_on());
@@ -1537,20 +2260,37 @@ mod tests {
                 seen[s.life.colony()[i] as usize] += 1;
             }
         }
-        assert!(seen.iter().filter(|&&n| n > 20).count() >= 2, "several colonies alive: {seen:?}");
-        assert!(seen[s.life.ncolonies()..].iter().all(|&n| n == 0), "no colony id out of range");
+        assert!(
+            seen.iter().filter(|&&n| n > 20).count() >= 2,
+            "several colonies alive: {seen:?}"
+        );
+        assert!(
+            seen[s.life.ncolonies()..].iter().all(|&n| n == 0),
+            "no colony id out of range"
+        );
     }
 
     #[test]
     fn fixed_colour_turns_colonies_off() {
-        let cfg = Config { colonies: true, color: ColorMode::Fixed([1, 2, 3]), ..quiet_cfg() };
+        let cfg = Config {
+            colonies: true,
+            color: ColorMode::Fixed([1, 2, 3]),
+            ..quiet_cfg()
+        };
         let s = Sim::new(30, 30, Instant::now(), &cfg);
         assert!(!s.life.colonies_on());
     }
 
     #[test]
     fn decay_clears_a_frozen_board_but_not_a_busy_one() {
-        let cfg = Config { decay_after: 20, decay_chance: 0.2, clutter_pct: 0.0, calm_pct: 0.0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let cfg = Config {
+            decay_after: 20,
+            decay_chance: 0.2,
+            clutter_pct: 0.0,
+            calm_pct: 0.0,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         s.life.clear();
@@ -1558,13 +2298,23 @@ mod tests {
         run(&mut s, &cfg, t0, 400);
         // 48 blocks = 192 cells. Half-decayed blocks can regrow into new shapes, so
         // the bar is "well under half", not "zero".
-        assert!(s.life.population() < 96, "frozen blocks must decay, {} cells left", s.life.population());
+        assert!(
+            s.life.population() < 96,
+            "frozen blocks must decay, {} cells left",
+            s.life.population()
+        );
         assert_eq!(s.gen, 400);
     }
 
     #[test]
     fn rotate_rule_never_gets_stuck_in_a_shift_after_reseed() {
-        let cfg = Config { rule: RuleSel::Rotate, rule_shift_secs: 1, rule_shift_gens: 50, rule_shift_mode: ShiftMode::Global, ..quiet_cfg() };
+        let cfg = Config {
+            rule: RuleSel::Rotate,
+            rule_shift_secs: 1,
+            rule_shift_gens: 50,
+            rule_shift_mode: ShiftMode::Global,
+            ..quiet_cfg()
+        };
         let t0 = Instant::now();
         let mut s = Sim::new(40, 30, t0, &cfg);
         let mut now = t0;
@@ -1573,7 +2323,11 @@ mod tests {
             s.tick(now, &cfg, 0.0);
             if i % 40 == 39 {
                 s.reseed(&cfg);
-                assert_eq!(s.life.rule(), s.base_rule(), "a reseed ends any running shift");
+                assert_eq!(
+                    s.life.rule(),
+                    s.base_rule(),
+                    "a reseed ends any running shift"
+                );
             }
         }
     }
@@ -1581,7 +2335,13 @@ mod tests {
     // ------------------------------------------------------------ ripple
 
     fn ripple_cfg() -> Config {
-        Config { rule_shift_secs: 2, rule_shift_gens: 5, rule_shift_stagger: 3, tile_size: 8, ..quiet_cfg() }
+        Config {
+            rule_shift_secs: 2,
+            rule_shift_gens: 5,
+            rule_shift_stagger: 3,
+            tile_size: 8,
+            ..quiet_cfg()
+        }
     }
 
     /// 20 x 12 tiles of 8 x 8 cells.
@@ -1601,7 +2361,11 @@ mod tests {
         for _ in 0..240 {
             now += Duration::from_millis(250);
             s.tick(now, &cfg, 0.0);
-            assert_eq!(s.rule(), base, "a ripple never changes the board's own rule");
+            assert_eq!(
+                s.rule(),
+                base,
+                "a ripple never changes the board's own rule"
+            );
             let on = s.life.alt_cells();
             peak = peak.max(on);
             if on > 0 && !was_on {
@@ -1614,11 +2378,24 @@ mod tests {
         }
         assert!(ripples >= 3, "ripples keep coming, got {ripples}");
         assert!(peak > 64, "more than one tile is on at once ({peak} cells)");
-        assert!(peak < total / 2, "but never close to the whole board: {peak} of {total}");
-        assert!(peak > total / 20, "and a real band of tiles, not a speck: {peak} of {total}");
+        assert!(
+            peak < total / 2,
+            "but never close to the whole board: {peak} of {total}"
+        );
+        assert!(
+            peak > total / 20,
+            "and a real band of tiles, not a speck: {peak} of {total}"
+        );
         // the first ripple starts at a single tile (ring 0) and then grows
-        assert_eq!(first_sizes[0], 64, "starts at one 8x8 tile, got {}", first_sizes[0]);
-        assert!(first_sizes.iter().any(|&n| n > 64), "and spreads: {first_sizes:?}");
+        assert_eq!(
+            first_sizes[0], 64,
+            "starts at one 8x8 tile, got {}",
+            first_sizes[0]
+        );
+        assert!(
+            first_sizes.iter().any(|&n| n > 64),
+            "and spreads: {first_sizes:?}"
+        );
         assert_eq!(s.gen, 240, "a ripple is not a reset");
     }
 
@@ -1634,7 +2411,11 @@ mod tests {
             s.tick(now, &cfg, 0.0);
             seen_on |= s.life.alt_cells() > 0;
             if seen_on && s.ripple.is_none() {
-                assert_eq!(s.life.alt_cells(), 0, "the ripple is over: no tile may stay switched");
+                assert_eq!(
+                    s.life.alt_cells(),
+                    0,
+                    "the ripple is over: no tile may stay switched"
+                );
                 return;
             }
         }
@@ -1669,7 +2450,15 @@ mod tests {
         b.seed_rng(9);
         // same board in both
         let cells = a.cells().to_vec();
-        b.load(&Saved { cols: 40, rows: 30, rule: "life".into(), cells: cells.clone(), age: vec![0; 1200], colony: Vec::new() });
+        b.load(&Saved {
+            cols: 40,
+            rows: 30,
+            rule: "life".into(),
+            cells: cells.clone(),
+            age: vec![0; 1200],
+            colony: Vec::new(),
+            grid: Grid::Square,
+        });
         assert!(b.begin_alt(Rule::parse("b36/s23").unwrap())); // mask stays all zero
         for _ in 0..30 {
             a.step();
@@ -1707,7 +2496,11 @@ mod tests {
 
     #[test]
     fn a_board_with_one_tile_falls_back_to_the_whole_board_shift() {
-        let cfg = Config { rule_shift_secs: 1, rule_shift_gens: 5, ..quiet_cfg() }; // tile_size 16 > 12
+        let cfg = Config {
+            rule_shift_secs: 1,
+            rule_shift_gens: 5,
+            ..quiet_cfg()
+        }; // tile_size 16 > 12
         let t0 = Instant::now();
         let mut s = Sim::new(12, 12, t0, &cfg);
         let base = s.rule();
@@ -1728,11 +2521,50 @@ mod tests {
     fn spots_are_cells_clipped_to_the_grid() {
         // 8 px cells on a 100 x 50 grid
         let sp = |x, y, w, h| Spot::from_px(x, y, w, h, 8, 100, 50);
-        assert_eq!(sp(16, 24, 80, 40), Some(Spot { x: 2, y: 3, w: 10, h: 5 }));
-        assert_eq!(sp(17, 25, 80, 40), Some(Spot { x: 2, y: 3, w: 11, h: 6 }), "partly covered cells count");
-        assert_eq!(sp(-40, -16, 100, 100), Some(Spot { x: 0, y: 0, w: 8, h: 11 }), "clipped at the top-left");
-        assert_eq!(sp(700, 380, 400, 400), Some(Spot { x: 87, y: 47, w: 13, h: 3 }), "clipped at the bottom-right");
-        assert_eq!(sp(900, 0, 50, 50), None, "entirely to the right of this output");
+        assert_eq!(
+            sp(16, 24, 80, 40),
+            Some(Spot {
+                x: 2,
+                y: 3,
+                w: 10,
+                h: 5
+            })
+        );
+        assert_eq!(
+            sp(17, 25, 80, 40),
+            Some(Spot {
+                x: 2,
+                y: 3,
+                w: 11,
+                h: 6
+            }),
+            "partly covered cells count"
+        );
+        assert_eq!(
+            sp(-40, -16, 100, 100),
+            Some(Spot {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 11
+            }),
+            "clipped at the top-left"
+        );
+        assert_eq!(
+            sp(700, 380, 400, 400),
+            Some(Spot {
+                x: 87,
+                y: 47,
+                w: 13,
+                h: 3
+            }),
+            "clipped at the bottom-right"
+        );
+        assert_eq!(
+            sp(900, 0, 50, 50),
+            None,
+            "entirely to the right of this output"
+        );
         assert_eq!(sp(-200, 0, 100, 50), None, "entirely to the left");
         assert_eq!(sp(0, 0, 0, 10), None);
         assert_eq!(Spot::from_px(0, 0, 10, 10, 0, 100, 50), None);
@@ -1749,12 +2581,20 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Sim::new(200, 120, t0, &cfg);
         s.life.clear();
-        let spot = Spot { x: 100, y: 60, w: 24, h: 16 };
+        let spot = Spot {
+            x: 100,
+            y: 60,
+            w: 24,
+            h: 16,
+        };
         s.on_event_at(HyprEvent::CloseWindow, spot, t0, &cfg);
         let cells = cells_of(&s);
         assert!(cells.len() > 40, "a bloom, got {}", cells.len());
         for (x, y) in cells {
-            assert!((100..124).contains(&x) && (60..76).contains(&y), "({x},{y}) is outside the window's footprint");
+            assert!(
+                (100..124).contains(&x) && (60..76).contains(&y),
+                "({x},{y}) is outside the window's footprint"
+            );
         }
     }
 
@@ -1764,7 +2604,17 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Sim::new(200, 120, t0, &cfg);
         s.life.clear();
-        s.on_event_at(HyprEvent::CloseWindow, Spot { x: 0, y: 0, w: 200, h: 120 }, t0, &cfg);
+        s.on_event_at(
+            HyprEvent::CloseWindow,
+            Spot {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 120,
+            },
+            t0,
+            &cfg,
+        );
         let (mut x0, mut x1, mut y0, mut y1) = (usize::MAX, 0, usize::MAX, 0);
         for (x, y) in cells_of(&s) {
             x0 = x0.min(x);
@@ -1772,11 +2622,32 @@ mod tests {
             y0 = y0.min(y);
             y1 = y1.max(y);
         }
-        assert!(x1 - x0 < BLOOM_MAX.0 && y1 - y0 < BLOOM_MAX.1, "capped: {}x{}", x1 - x0 + 1, y1 - y0 + 1);
-        assert!((60..140).contains(&x0) && (30..90).contains(&y0), "and centred in the window");
+        assert!(
+            x1 - x0 < BLOOM_MAX.0 && y1 - y0 < BLOOM_MAX.1,
+            "capped: {}x{}",
+            x1 - x0 + 1,
+            y1 - y0 + 1
+        );
+        assert!(
+            (60..140).contains(&x0) && (30..90).contains(&y0),
+            "and centred in the window"
+        );
         s.spawn.clear();
-        s.on_event_at(HyprEvent::CloseWindow, Spot { x: 50, y: 50, w: 1, h: 1 }, t0 + Duration::from_secs(1), &cfg);
-        assert!(!s.spawn.is_empty(), "a one-cell window still blooms (at least a small patch)");
+        s.on_event_at(
+            HyprEvent::CloseWindow,
+            Spot {
+                x: 50,
+                y: 50,
+                w: 1,
+                h: 1,
+            },
+            t0 + Duration::from_secs(1),
+            &cfg,
+        );
+        assert!(
+            !s.spawn.is_empty(),
+            "a one-cell window still blooms (at least a small patch)"
+        );
     }
 
     #[test]
@@ -1785,19 +2656,37 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Sim::new(200, 120, t0, &cfg);
         s.life.clear();
-        let spot = Spot { x: 60, y: 40, w: 40, h: 30 };
+        let spot = Spot {
+            x: 60,
+            y: 40,
+            w: 40,
+            h: 30,
+        };
         s.on_event_at(HyprEvent::OpenWindow, spot, t0, &cfg);
         let cells = cells_of(&s);
         assert!(!cells.is_empty());
         for (x, y) in cells {
             let inside = (60..100).contains(&x) && (40..70).contains(&y);
             assert!(!inside, "({x},{y}) is under the window");
-            assert!((57..103).contains(&x) && (37..73).contains(&y), "({x},{y}) is beyond the halo");
+            assert!(
+                (57..103).contains(&x) && (37..73).contains(&y),
+                "({x},{y}) is beyond the halo"
+            );
         }
         // a window that fills the whole output leaves no halo to draw
         let mut s = Sim::new(200, 120, t0, &cfg);
         s.life.clear();
-        s.on_event_at(HyprEvent::OpenWindow, Spot { x: 0, y: 0, w: 200, h: 120 }, t0, &cfg);
+        s.on_event_at(
+            HyprEvent::OpenWindow,
+            Spot {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 120,
+            },
+            t0,
+            &cfg,
+        );
         assert!(s.spawn.is_empty());
     }
 
@@ -1809,22 +2698,75 @@ mod tests {
             let mut s = Sim::new(c, r, t0, &cfg);
             let mut now = t0;
             for spot in [
-                Spot { x: 0, y: 0, w: 1, h: 1 },
-                Spot { x: c - 1, y: r - 1, w: 1, h: 1 },
-                Spot { x: 0, y: 0, w: c, h: r },
-                Spot { x: c / 2, y: r / 2, w: 50, h: 50 },
-                Spot { x: c + 5, y: 0, w: 4, h: 4 },
+                Spot {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+                Spot {
+                    x: c - 1,
+                    y: r - 1,
+                    w: 1,
+                    h: 1,
+                },
+                Spot {
+                    x: 0,
+                    y: 0,
+                    w: c,
+                    h: r,
+                },
+                Spot {
+                    x: c / 2,
+                    y: r / 2,
+                    w: 50,
+                    h: 50,
+                },
+                Spot {
+                    x: c + 5,
+                    y: 0,
+                    w: 4,
+                    h: 4,
+                },
             ] {
-                for ev in [HyprEvent::OpenWindow, HyprEvent::CloseWindow, HyprEvent::Workspace] {
+                for ev in [
+                    HyprEvent::OpenWindow,
+                    HyprEvent::CloseWindow,
+                    HyprEvent::Workspace,
+                ] {
                     now += Duration::from_secs(1);
                     s.on_event_at(ev, spot, now, &cfg);
                 }
             }
             let n = s.spawn.len();
-            s.on_event_at(HyprEvent::CloseWindow, Spot { x: 0, y: 0, w: 4, h: 4 }, now + Duration::from_secs(1), &cfg);
+            s.on_event_at(
+                HyprEvent::CloseWindow,
+                Spot {
+                    x: 0,
+                    y: 0,
+                    w: 4,
+                    h: 4,
+                },
+                now + Duration::from_secs(1),
+                &cfg,
+            );
             let grown = s.spawn.len();
-            s.on_event_at(HyprEvent::CloseWindow, Spot { x: 0, y: 0, w: 4, h: 4 }, now + Duration::from_millis(1100), &cfg);
-            assert_eq!(s.spawn.len(), grown, "second located event inside the cooldown is dropped ({c}x{r})");
+            s.on_event_at(
+                HyprEvent::CloseWindow,
+                Spot {
+                    x: 0,
+                    y: 0,
+                    w: 4,
+                    h: 4,
+                },
+                now + Duration::from_millis(1100),
+                &cfg,
+            );
+            assert_eq!(
+                s.spawn.len(),
+                grown,
+                "second located event inside the cooldown is dropped ({c}x{r})"
+            );
             assert!(grown >= n);
         }
     }
@@ -1854,12 +2796,22 @@ mod tests {
         s.life.seed(&mut rng, 0.5);
         let pop = s.life.population();
         s.on_beat(1.0, t0);
-        assert_eq!(s.life.population(), pop, "a crowded board gets no more gliders");
-        let seeds = Config { rule: RuleSel::Fixed(crate::life::SEEDS), ..quiet_cfg() };
+        assert_eq!(
+            s.life.population(),
+            pop,
+            "a crowded board gets no more gliders"
+        );
+        let seeds = Config {
+            rule: RuleSel::Fixed(crate::life::SEEDS),
+            ..quiet_cfg()
+        };
         let mut s = Sim::new(60, 40, t0, &seeds);
         s.life.clear();
         s.on_beat(0.2, t0);
-        assert!(s.life.population() > 0 && s.life.population() <= 9, "a spark, not a glider");
+        assert!(
+            s.life.population() > 0 && s.life.population() <= 9,
+            "a spark, not a glider"
+        );
     }
 
     // -------------------------------------------------------------- clock
@@ -1874,7 +2826,10 @@ mod tests {
         s.set_clock(Some(14 * 60 + 7));
         assert!(s.inject_clock_stamp());
         let (w, h) = bbox(&s.life).unwrap();
-        assert!((20..=29).contains(&w) && (6..=7).contains(&h), "five 5x7 glyphs, got {w}x{h}");
+        assert!(
+            (20..=29).contains(&w) && (6..=7).contains(&h),
+            "five 5x7 glyphs, got {w}x{h}"
+        );
         // the same pixels the font gives for "14:07"
         let pat = patterns::text(&Font::build(), "14:07");
         assert_eq!(s.life.population(), pat.cells.len());
@@ -1892,26 +2847,44 @@ mod tests {
     #[test]
     fn the_clock_stamp_arrives_on_its_own_timer_and_only_when_asked_for() {
         let t0 = Instant::now();
-        let base = Config { stamps: true, stamp_min_secs: 100_000, stamp_max_secs: 100_000, clock_stamp_secs: 2, local_calm_secs: 0, stagnation_secs: 86_400, ..quiet_cfg() };
+        let base = Config {
+            stamps: true,
+            stamp_min_secs: 100_000,
+            stamp_max_secs: 100_000,
+            clock_stamp_secs: 2,
+            local_calm_secs: 0,
+            stagnation_secs: 86_400,
+            ..quiet_cfg()
+        };
         let mut s = Sim::new(120, 80, t0, &base);
         s.life.clear();
         s.set_clock(Some(9 * 60 + 41));
         run(&mut s, &base, t0, 24); // 6 s, the stamp is due after 1.5 to 2.5 s
         assert!(s.life.population() > 0, "the stamp never appeared");
 
-        let off = Config { clock_stamp_secs: 0, ..base.clone() };
+        let off = Config {
+            clock_stamp_secs: 0,
+            ..base.clone()
+        };
         let mut s = Sim::new(120, 80, t0, &off);
         s.life.clear();
         s.set_clock(Some(9 * 60 + 41));
         run(&mut s, &off, t0, 400);
         assert_eq!(s.life.population(), 0, "clock_stamp_secs = 0 means off");
 
-        let no_stamps = Config { stamps: false, ..base };
+        let no_stamps = Config {
+            stamps: false,
+            ..base
+        };
         let mut s = Sim::new(120, 80, t0, &no_stamps);
         s.life.clear();
         s.set_clock(Some(9 * 60 + 41));
         run(&mut s, &no_stamps, t0, 80);
-        assert_eq!(s.life.population(), 0, "stamps = false switches the clock off too");
+        assert_eq!(
+            s.life.population(),
+            0,
+            "stamps = false switches the clock off too"
+        );
     }
 
     // ---------------------------------------------------- replay and health
@@ -1947,16 +2920,36 @@ mod tests {
 
     /// Run `secs` simulated seconds at 8 generations per second and measure
     /// everything after the first minute (the opening soup is not typical).
-    fn long_run(cfg: &Config, (cols, rows): (usize, usize), secs: u64, seed: u64, verbose: bool, prep: &dyn Fn(&mut Sim)) -> Health {
+    fn long_run(
+        cfg: &Config,
+        (cols, rows): (usize, usize),
+        secs: u64,
+        seed: u64,
+        verbose: bool,
+        prep: &dyn Fn(&mut Sim),
+    ) -> Health {
         let t0 = Instant::now();
         let mut s = Sim::seeded(cols, rows, t0, cfg, seed);
         prep(&mut s);
         let total = (cols * rows) as f64;
-        let mut h = Health { min_pop: f64::MAX, max_pop: 0.0, mean_pop: 0.0, mean_active: 0.0, max_settled: 0.0, mean_settled: 0.0, ff_share: 0.0, min_colonies: usize::MAX, no_reset: true };
+        let mut h = Health {
+            min_pop: f64::MAX,
+            max_pop: 0.0,
+            mean_pop: 0.0,
+            mean_active: 0.0,
+            max_settled: 0.0,
+            mean_settled: 0.0,
+            ff_share: 0.0,
+            min_colonies: usize::MAX,
+            no_reset: true,
+        };
         let (mut n, mut ff, mut last_gen) = (0u64, 0u64, 0u64);
         let mut now = t0;
         if verbose {
-            println!("{:>5} {:>6} {:>6} {:>7} {:>5}  colony shares (%)", "sec", "pop%", "active", "settled", "gen");
+            println!(
+                "{:>5} {:>6} {:>6} {:>7} {:>5}  colony shares (%)",
+                "sec", "pop%", "active", "settled", "gen"
+            );
         }
         for tick in 1..=(secs * 8) {
             now += Duration::from_millis(125);
@@ -1970,7 +2963,10 @@ mod tests {
             }
             let (live, settled) = s.life.census();
             let pop = s.life.population() as f64 * 100.0 / total;
-            let (settled_pct, active_pct) = (settled as f64 * 100.0 / total, (live - settled) as f64 * 100.0 / total);
+            let (settled_pct, active_pct) = (
+                settled as f64 * 100.0 / total,
+                (live - settled) as f64 * 100.0 / total,
+            );
             h.min_pop = h.min_pop.min(pop);
             h.max_pop = h.max_pop.max(pop);
             h.max_settled = h.max_settled.max(settled_pct);
@@ -1986,11 +2982,25 @@ mod tests {
                         share[s.life.colony()[i] as usize] += 1;
                     }
                 }
-                let big = share[..s.life.ncolonies()].iter().filter(|&&c| c * 100 >= live.max(1)).count();
+                let big = share[..s.life.ncolonies()]
+                    .iter()
+                    .filter(|&&c| c * 100 >= live.max(1))
+                    .count();
                 h.min_colonies = h.min_colonies.min(big);
                 if verbose {
-                    let sh: Vec<String> = share[..s.life.ncolonies()].iter().map(|&c| format!("{:.0}", c as f64 * 100.0 / live.max(1) as f64)).collect();
-                    println!("{:>5.0} {:>6.1} {:>6.1} {:>7.1} {:>5}  {}", sec, pop, active_pct, settled_pct, s.gen, sh.join(" "));
+                    let sh: Vec<String> = share[..s.life.ncolonies()]
+                        .iter()
+                        .map(|&c| format!("{:.0}", c as f64 * 100.0 / live.max(1) as f64))
+                        .collect();
+                    println!(
+                        "{:>5.0} {:>6.1} {:>6.1} {:>7.1} {:>5}  {}",
+                        sec,
+                        pop,
+                        active_pct,
+                        settled_pct,
+                        s.gen,
+                        sh.join(" ")
+                    );
                 }
             }
         }
@@ -2016,11 +3026,23 @@ mod tests {
         assert!(h.no_reset, "the board was reset. {ctx}");
         assert!(h.min_pop >= 1.0, "the board went (nearly) dead. {ctx}");
         assert!(h.max_pop <= 30.0, "the board filled up. {ctx}");
-        assert!((2.5..=16.0).contains(&h.mean_pop), "typical population is off. {ctx}");
+        assert!(
+            (2.5..=16.0).contains(&h.mean_pop),
+            "typical population is off. {ctx}"
+        );
         assert!(h.mean_active >= 1.5, "too little is moving. {ctx}");
-        assert!(h.mean_settled <= 3.0, "too many frozen shapes on average. {ctx}");
-        assert!(h.max_settled <= cfg.clutter_pct + 3.0, "pruning lets clutter through. {ctx}");
-        assert!(h.ff_share <= 0.35, "the board is calm so often that it fast-forwards. {ctx}");
+        assert!(
+            h.mean_settled <= 3.0,
+            "too many frozen shapes on average. {ctx}"
+        );
+        assert!(
+            h.max_settled <= cfg.clutter_pct + 3.0,
+            "pruning lets clutter through. {ctx}"
+        );
+        assert!(
+            h.ff_share <= 0.35,
+            "the board is calm so often that it fast-forwards. {ctx}"
+        );
         assert!(h.min_colonies >= 2, "one colour took over. {ctx}");
     }
 
@@ -2055,7 +3077,10 @@ mod tests {
             ..Config::default()
         };
         let h = long_run(&dead, (80, 50), 300, 1, false, &|_| {});
-        assert!(h.min_pop < 1.0, "a board with nothing feeding it must register as dead: {h:?}");
+        assert!(
+            h.min_pop < 1.0,
+            "a board with nothing feeding it must register as dead: {h:?}"
+        );
         // Clogged: no decay, no pruning, no help, and a board full of blocks.
         let clogged = Config {
             decay_after: 0,
@@ -2082,7 +3107,10 @@ mod tests {
             }
         };
         let h = long_run(&clogged, (80, 50), 300, 1, false, &lattice);
-        assert!(h.mean_settled > 3.0, "a board that is never thinned must register as clogged: {h:?}");
+        assert!(
+            h.mean_settled > 3.0,
+            "a board that is never thinned must register as clogged: {h:?}"
+        );
     }
 
     /// Not a test: `cargo test --release long_run -- --ignored --nocapture`
@@ -2113,8 +3141,338 @@ mod tests {
         if let Some(g) = std::env::var("LW_GENS").ok().and_then(|v| v.parse().ok()) {
             cfg.rule_shift_gens = g;
         }
-        let seed = std::env::var("LW_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let seed = std::env::var("LW_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
         let h = long_run(&cfg, (240, 135), 600, seed, true, &|_| {});
         println!("{h:#?}");
+    }
+
+    // ------------------------------------------------------- shared clock, inject
+
+    #[test]
+    fn beats_events_and_injections_share_one_clock() {
+        let cfg = quiet_cfg();
+        let t0 = Instant::now();
+        let mut s = Sim::new(120, 80, t0, &cfg);
+        s.life.clear();
+        s.on_beat(0.3, t0);
+        let after_beat = s.life.population();
+        assert_eq!(after_beat, 5);
+        // same tick: a Hyprland event and a scripted injection are both turned away
+        s.on_event(HyprEvent::Workspace, t0, &cfg);
+        assert_eq!(s.life.population(), after_beat, "event right after a beat");
+        assert!(
+            s.inject("glider", None, None, &cfg, t0, true).is_err(),
+            "inject right after a beat"
+        );
+        // an unrelated direction: an event first, then a beat
+        let mut s = Sim::new(120, 80, t0, &cfg);
+        s.life.clear();
+        s.on_event(HyprEvent::Workspace, t0, &cfg);
+        let pop = s.life.population();
+        s.on_beat(0.3, t0 + Duration::from_millis(100));
+        assert_eq!(s.life.population(), pop, "beat right after an event");
+        // an ungated injection (--once) ignores the clock
+        let mut s = Sim::new(120, 80, t0, &cfg);
+        s.life.clear();
+        s.on_beat(0.3, t0);
+        assert!(s.inject("blinker", None, None, &cfg, t0, false).is_ok());
+    }
+
+    #[test]
+    fn inject_places_named_patterns_where_asked() {
+        let cfg = quiet_cfg();
+        let t0 = Instant::now();
+        let mut s = Sim::new(120, 80, t0, &cfg);
+        s.life.clear();
+        assert_eq!(
+            s.inject("glider", Some((10, 10)), None, &cfg, t0, false),
+            Ok("injected glider".into())
+        );
+        assert_eq!(s.life.population(), 5);
+        assert_eq!(
+            s.life.count_in(10, 10, 3, 3),
+            5,
+            "top-left at the given cell"
+        );
+        s.life.clear();
+        s.inject("pentadecathlon", Some((20, 20)), None, &cfg, t0, false)
+            .unwrap();
+        assert_eq!(s.life.count_in(20, 20, 10, 3), 12);
+        s.life.clear();
+        s.inject("lwss", None, Some(Edge::Left), &cfg, t0, false)
+            .unwrap();
+        assert_eq!(s.life.population(), 9);
+        assert!(
+            s.life.count_in(0, 0, 6, 80) == 9,
+            "entered from the left edge"
+        );
+        s.life.clear();
+        s.inject("text=hi", Some((5, 5)), None, &cfg, t0, false)
+            .unwrap();
+        assert!(s.life.population() > 5);
+        assert!(s
+            .inject("no-such-thing", None, None, &cfg, t0, false)
+            .is_err());
+        assert!(
+            s.inject("glider", Some((500, 5)), None, &cfg, t0, false)
+                .is_err(),
+            "off the board"
+        );
+        assert!(
+            s.inject("gun", Some((100, 5)), None, &cfg, t0, false)
+                .is_err(),
+            "gun does not fit there"
+        );
+        assert!(s.inject("text=", None, None, &cfg, t0, false).is_err());
+    }
+
+    #[test]
+    fn every_named_pattern_can_be_injected_on_a_roomy_board() {
+        let cfg = quiet_cfg();
+        let t0 = Instant::now();
+        let mut s = Sim::new(160, 100, t0, &cfg);
+        for n in patterns::NAMES {
+            s.life.clear();
+            assert!(s.inject(n, None, None, &cfg, t0, false).is_ok(), "{n}");
+            assert!(s.life.population() > 0, "{n}");
+        }
+        for n in ["soup", "convoy", "methuselah"] {
+            s.life.clear();
+            s.inject(n, None, None, &cfg, t0, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_configured_shift_rule_list_is_what_gets_used() {
+        let only = crate::life::Rule::parse("b3/s234").unwrap();
+        let cfg = Config {
+            rule_shift_secs: 1,
+            rule_shift_mode: ShiftMode::Global,
+            rule_shift_rules: vec![only],
+            rule_shift_gens: 50,
+            ..quiet_cfg()
+        };
+        let t0 = Instant::now();
+        let mut s = Sim::new(40, 30, t0, &cfg);
+        let mut now = t0;
+        let mut seen = false;
+        for _ in 0..40 {
+            now += Duration::from_millis(250);
+            s.tick(now, &cfg, 0.0);
+            if s.life.rule() == only {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "the shift swapped in the only rule on the list");
+    }
+
+    #[test]
+    fn mid_sparks_treble_noise_and_colony_counts() {
+        let cfg = Config {
+            colonies: true,
+            ..quiet_cfg()
+        };
+        let t0 = Instant::now();
+        let mut s = Sim::new(80, 60, t0, &cfg);
+        s.life.clear();
+        s.on_spark(t0);
+        assert!(s.life.population() > 0);
+        let pop = s.life.population();
+        s.on_spark(t0 + Duration::from_millis(10));
+        assert_eq!(s.life.population(), pop, "sparks share the clock too");
+        s.on_noise(); // must not panic, adds no structure
+        assert_eq!(s.colony_counts().iter().sum::<usize>(), s.life.population());
+        let off = quiet_cfg();
+        let s2 = Sim::new(40, 30, t0, &off);
+        assert!(s2.colony_counts().is_empty());
+    }
+
+    #[test]
+    fn scenes_bring_back_a_board_even_under_another_rule() {
+        let cfg = Config::default();
+        let mut a = Sim::new(30, 20, Instant::now(), &cfg);
+        a.life.clear();
+        a.life.set_rule(crate::life::HIGHLIFE);
+        a.life.place(&Pattern::from_art(&["###"]), 4, 4, 0);
+        let saved = Saved {
+            cols: 30,
+            rows: 20,
+            rule: a.life.rule().name(),
+            cells: a.life.cells().to_vec(),
+            age: a.life.age().to_vec(),
+            colony: a.life.colony().to_vec(),
+            grid: Grid::Square,
+        };
+        let mut b = Sim::new(30, 20, Instant::now(), &cfg);
+        b.load_scene(&saved).unwrap();
+        assert_eq!(b.life.cells(), a.life.cells());
+        assert_eq!(b.life.rule(), crate::life::HIGHLIFE);
+        let bad = Saved {
+            rule: "nonsense".into(),
+            ..saved
+        };
+        assert!(b.load_scene(&bad).is_err());
+    }
+
+    #[test]
+    fn a_new_track_blooms_in_its_artists_colour() {
+        let cfg = Config {
+            colonies: true,
+            ..quiet_cfg()
+        };
+        let t0 = Instant::now();
+        let mut s = Sim::new(80, 60, t0, &cfg);
+        s.life.clear();
+        s.on_track(Some(2), t0);
+        for _ in 0..40 {
+            s.drip();
+        }
+        assert!(s.life.population() > 0, "the soup was dripped in");
+        let counts = s.colony_counts();
+        let n = counts.len();
+        assert!(n >= 2);
+        assert_eq!(
+            counts[2 % n],
+            s.life.population(),
+            "all of it in the artist's colony"
+        );
+        let pop = s.life.population();
+        s.on_track(Some(1), t0 + Duration::from_millis(100));
+        assert_eq!(s.life.population(), pop, "shares the injection clock");
+    }
+
+    #[test]
+    fn sparkline_samples_once_a_second_only_while_it_is_on() {
+        let on = Config {
+            overlay: true,
+            overlay_sparkline: true,
+            ..quiet_cfg()
+        };
+        let off = Config {
+            overlay: true,
+            overlay_sparkline: false,
+            ..quiet_cfg()
+        };
+        let t0 = Instant::now();
+        let mut a = Sim::new(40, 30, t0, &on);
+        let mut b = Sim::new(40, 30, t0, &off);
+        for i in 0..40 {
+            let now = t0 + Duration::from_millis(250 * i);
+            a.tick(now, &on, 0.0);
+            b.tick(now, &off, 0.0);
+        }
+        assert!(
+            (9..=11).contains(&a.sparkline().len()),
+            "{}",
+            a.sparkline().len()
+        );
+        assert!(b.sparkline().is_empty(), "no cost when off");
+        let mut c = Sim::new(40, 30, t0, &on);
+        for i in 0..(SPARK_LEN as u64 + 20) {
+            c.tick(t0 + Duration::from_secs(i), &on, 0.0);
+        }
+        assert_eq!(c.sparkline().len(), SPARK_LEN, "bounded");
+    }
+
+    #[test]
+    fn a_workspace_ripple_starts_once_and_needs_room_to_ripple() {
+        let cfg = Config {
+            tile_size: 8,
+            ..quiet_cfg()
+        };
+        let mut s = Sim::new(80, 60, Instant::now(), &cfg);
+        assert!(s.on_workspace_ripple(&cfg));
+        assert!(!s.on_workspace_ripple(&cfg), "one at a time");
+        let one_tile = Config {
+            tile_size: 64,
+            ..quiet_cfg()
+        };
+        let mut t = Sim::new(16, 16, Instant::now(), &one_tile);
+        assert!(
+            !t.on_workspace_ripple(&one_tile),
+            "a single tile has nothing to ripple across"
+        );
+    }
+
+    #[test]
+    fn bloom_places_a_pulsar_and_shares_the_clock() {
+        let cfg = quiet_cfg();
+        let t0 = Instant::now();
+        let mut s = Sim::new(100, 70, t0, &cfg);
+        s.life.clear();
+        assert!(s.on_bloom(t0));
+        assert_eq!(s.life.population(), patterns::pulsar().cells.len());
+        assert!(!s.on_bloom(t0 + Duration::from_millis(10)), "cooldown");
+    }
+
+    #[test]
+    fn cursor_modes_add_cells_only_where_the_pointer_is() {
+        let cfg = quiet_cfg();
+        let mut s = Sim::new(60, 40, Instant::now(), &cfg);
+        s.life.clear();
+        s.on_cursor(CursorMode::Trail, Some((10, 10)), (20, 10), 1);
+        assert_eq!(
+            s.life.count_in(10, 10, 11, 1),
+            11,
+            "a one-cell-wide line from 10 to 20"
+        );
+        assert_eq!(s.life.population(), 11);
+        s.life.clear();
+        s.on_cursor(CursorMode::Sparkle, None, (30, 20), 2);
+        assert!(s.life.population() > 0 && s.life.count_in(28, 18, 5, 5) == s.life.population());
+        s.life.clear();
+        s.on_cursor(CursorMode::Soup, None, (30, 20), 2);
+        for _ in 0..60 {
+            s.drip();
+        }
+        assert!(s.life.population() > 0 && s.life.count_in(28, 18, 5, 5) == s.life.population());
+        s.life.clear();
+        s.on_cursor(CursorMode::Trail, None, (59, 39), 3); // at the corner: clipped, no panic
+        assert!(s.life.population() > 0);
+    }
+
+    #[test]
+    fn a_hex_board_runs_and_refuses_a_square_scene() {
+        let cfg = Config {
+            grid: Grid::Hex,
+            ..quiet_cfg()
+        };
+        let t0 = Instant::now();
+        let mut s = Sim::new(40, 30, t0, &cfg);
+        assert_eq!(s.life.grid(), Grid::Hex);
+        for i in 0..20 {
+            s.tick(t0 + Duration::from_millis(300 * i), &cfg, 0.0);
+        }
+        let sq = Sim::new(40, 30, t0, &quiet_cfg());
+        let saved = Saved {
+            cols: 40,
+            rows: 30,
+            rule: sq.life.rule().name(),
+            grid: Grid::Square,
+            cells: sq.life.cells().to_vec(),
+            age: sq.life.age().to_vec(),
+            colony: sq.life.colony().to_vec(),
+        };
+        assert!(s.load_scene(&saved).is_err());
+        assert!(!s.restore(&saved, &cfg));
+        // changing the grid on reload reseeds instead of keeping a meaningless board
+        let mut q = Sim::new(40, 30, t0, &quiet_cfg());
+        q.reconfigure(t0, &cfg);
+        assert_eq!(q.life.grid(), Grid::Hex);
+    }
+
+    #[test]
+    fn guns_can_be_switched_off_for_low_power() {
+        let cfg = quiet_cfg();
+        let mut s = Sim::new(120, 80, Instant::now(), &cfg);
+        s.set_guns_off(true);
+        for _ in 0..200 {
+            s.inject_special(Instant::now(), &cfg);
+        }
+        assert!(s.guns.is_empty(), "no gun was placed");
     }
 }

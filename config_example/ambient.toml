@@ -10,3 +10,12 @@ overlay = false
 sysload = false
 patterns = true
 stamps = false
+
+# Audio (only with audio = true): gentle light, no gliders
+audio_gliders = false
+audio_react = true
+audio_brighten = 0.2
+audio_glow = 0.2
+audio_flash = 0.2
+audio_attack_ms = 80
+audio_release_ms = 600

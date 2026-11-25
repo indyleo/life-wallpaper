@@ -15,3 +15,8 @@ newborn = "#8ec07c"
 mature = "#83a598"
 old = "#458588"
 ancient = "#3c6e71"
+
+# Audio stays off in this preset (and so does everything that goes with it).
+audio = false
+audio_react = false
+audio_gliders = false
