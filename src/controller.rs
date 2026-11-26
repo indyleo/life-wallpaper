@@ -27,7 +27,7 @@ use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use crate::config::{ColorMode, Config, CursorMode, RuleSel, ShiftMode};
 use crate::font::Font;
 use crate::hypr::HyprEvent;
-use crate::life::{Grid, Life, Rule, Sym, ROTATION, SYMMETRIES};
+use crate::life::{Life, Rule, Sym, ROTATION, SYMMETRIES};
 use crate::patterns;
 use crate::state::Saved;
 
@@ -1143,25 +1143,9 @@ impl Sim {
             let c = self.fresh_colony();
             self.life.set_brush(c);
             if self.life.rule().supports_ships() {
-                let before = self.life.population();
-                let snapshot = self.life.cells().to_vec();
-                let mut placed = false;
-                for _ in 0..8 {
-                    self.life.place_ship_on_edge(&mut self.rng, true, false);
-                    if self.life.population() == before + 5 {
-                        placed = true;
-                        break;
-                    }
-                    // Revert colliding attempt and retry.
-                    let _ = &snapshot;
-                    self.life.clear();
-                    for (idx, &v) in snapshot.iter().enumerate() {
-                        if v == 1 {
-                            self.life.set_alive(idx);
-                        }
-                    }
-                    self.life.set_brush(c);
-                }
+                // Look for an empty spot first; a glider dropped onto live
+                // cells would just merge with them.
+                let placed = (0..8).any(|_| self.life.place_glider_on_free_edge(&mut self.rng));
                 if !placed {
                     self.life.place_ship_on_edge(&mut self.rng, true, false);
                 }
@@ -1723,6 +1707,7 @@ impl Sim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::life::Grid;
     use crate::patterns::Pattern;
 
     /// Everything that adds, removes or speeds up life on its own is off, so

@@ -174,9 +174,6 @@ fn rnd(state: &mut u64) -> u32 {
     (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
 }
 
-/// Colony of a newborn cell: the majority among its live neighbours (ties
-/// broken at random), or now and then a random colony (mutation).
-#[inline]
 /// Indices of the neighbours of (x, y) on a torus, and how many there are.
 /// Hex is the "odd-r" offset layout: odd rows sit half a cell to the right, so
 /// the two cells above (and below) are x-1,x on even rows and x,x+1 on odd rows.
@@ -219,6 +216,9 @@ fn topo_neighbours(
     }
 }
 
+/// Colony of a newborn cell: the majority among its live neighbours (ties
+/// broken at random), or now and then a random colony (mutation).
+#[inline]
 fn inherit(cur: &[u8], colony: &[u8], nb: [usize; 8], nc: u8, mut_thr: u32, rng: &mut u64) -> u8 {
     if mut_thr > 0 && rnd(rng) < mut_thr {
         return (rnd(rng) % nc as u32) as u8;
@@ -521,7 +521,6 @@ impl Life {
         self.rows = rows;
     }
 
-    /// Advance one generation (edges wrap). Returns `true` if any cell changed.
     pub fn grid(&self) -> Grid {
         self.grid
     }
@@ -535,6 +534,7 @@ impl Life {
         }
     }
 
+    /// Advance one generation (edges wrap). Returns `true` if any cell changed.
     pub fn step(&mut self) -> bool {
         let changed = match self.rule {
             _ if self.grid != Grid::Square => self.step_topo(),
@@ -585,9 +585,6 @@ impl Life {
         changed
     }
 
-    /// `MIXED` = some cells follow the alternative rule (`self.alt`). The plain
-    /// path is compiled without the per-cell lookup, so a board with no ripple
-    /// running costs exactly what it did before.
     /// One generation on a hex or von Neumann board. The square board has its
     /// own unrolled fast path; this one looks the neighbours up per cell.
     fn step_topo(&mut self) -> bool {
@@ -644,6 +641,9 @@ impl Life {
         changed
     }
 
+    /// `MIXED` = some cells follow the alternative rule (`self.alt`). The plain
+    /// path is compiled without the per-cell lookup, so a board with no ripple
+    /// running costs exactly what it did before.
     fn step_lifelike<const MIXED: bool>(&mut self, birth: u16, survive: u16) -> bool {
         let (cols, rows) = (self.cols, self.rows);
         let (cur, next, colony) = (&self.cur, &mut self.next, &mut self.colony);
@@ -970,6 +970,18 @@ impl Life {
 
     /// A glider entering from `edge` (0 top, 1 bottom, 2 left, 3 right).
     pub fn place_glider_at_edge<R: Rng>(&mut self, rng: &mut R, edge: usize) -> bool {
+        self.glider_at_edge(rng, edge, false)
+    }
+
+    /// Like `place_glider_at_edge` from a random edge, but only if the spot
+    /// (and a one-cell border around it) is empty. Touches nothing otherwise,
+    /// so a caller can simply retry.
+    pub fn place_glider_on_free_edge<R: Rng>(&mut self, rng: &mut R) -> bool {
+        let edge = rng.gen_range(0..4);
+        self.glider_at_edge(rng, edge, true)
+    }
+
+    fn glider_at_edge<R: Rng>(&mut self, rng: &mut R, edge: usize, require_free: bool) -> bool {
         let flip = rng.gen_bool(0.5);
         let pat = {
             // heads SE; mirror so the heading has a positive component away from the edge
@@ -991,6 +1003,16 @@ impl Life {
             2 => (0, rng.gen_range(0..=my)),
             _ => (mx, rng.gen_range(0..=my)),
         };
+        if require_free
+            && self.count_in(
+                x.saturating_sub(1),
+                y.saturating_sub(1),
+                pat.w + 2,
+                pat.h + 2,
+            ) > 0
+        {
+            return false;
+        }
         self.place(&pat, x, y, 0);
         true
     }
